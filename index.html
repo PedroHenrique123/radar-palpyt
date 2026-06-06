@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Palpyt — Radar de notícias</title>
+<style>
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:#222; background:#fafafa; margin:0; line-height:1.45; font-size:15px;
+  }
+  .container{max-width:840px; margin:0 auto; padding:0 18px 50px;}
+
+  header{
+    display:flex; align-items:baseline; justify-content:space-between; gap:14px;
+    flex-wrap:wrap; border-bottom:1px solid #e2e2e2; padding:18px 0 14px; margin-bottom:6px;
+  }
+  .brand{font-size:18px; font-weight:700; color:#111;}
+  .brand span{font-weight:400; color:#777; font-size:14px; margin-left:8px;}
+  .head-right{display:flex; align-items:center; gap:14px; font-size:13px; color:#777;}
+  button{
+    font-family:inherit; font-size:13px; color:#222; background:#fff; cursor:pointer;
+    border:1px solid #ccc; border-radius:4px; padding:6px 12px;
+  }
+  button:hover{background:#f0f0f0;}
+  button:disabled{color:#999; cursor:default;}
+
+  .filtros{display:flex; gap:16px; flex-wrap:wrap; padding:12px 0 6px; font-size:13px;}
+  .filtros a{color:#555; text-decoration:none; cursor:pointer; padding-bottom:2px;}
+  .filtros a:hover{color:#111;}
+  .filtros a.on{color:#111; font-weight:600; border-bottom:2px solid #444;}
+
+  ul{list-style:none; margin:0; padding:0;}
+  li{display:flex; gap:14px; align-items:flex-start; padding:13px 2px; border-bottom:1px solid #ececec;}
+  li:hover{background:#f5f5f5;}
+  .score{
+    flex:0 0 38px; text-align:center; font-size:14px; font-weight:600; color:#666;
+    border:1px solid #e0e0e0; border-radius:4px; padding:3px 0; background:#fff;
+  }
+  .score.alto{color:#b1361f; border-color:#e8c4bc;}
+  .score.medio{color:#9a6a16;}
+  .corpo{flex:1; min-width:0;}
+  .corpo a.tit{color:#1a1a1a; text-decoration:none; font-weight:600; font-size:15.5px;}
+  .corpo a.tit:hover{text-decoration:underline;}
+  .meta{font-size:12.5px; color:#888; margin-top:3px;}
+  .cat{display:inline-flex; align-items:center; gap:5px;}
+  .dot{width:7px; height:7px; border-radius:50%; display:inline-block;}
+
+  .estado{padding:26px 2px; color:#888; font-size:14px;}
+  footer{margin-top:24px; font-size:12px; color:#999;}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <div class="brand">Palpyt <span>Radar de notícias</span></div>
+    <div class="head-right">
+      <span id="updated">—</span>
+      <button id="btn" onclick="carregar(true)">Atualizar</button>
+    </div>
+  </header>
+
+  <div class="filtros" id="filtros"></div>
+
+  <ul id="lista"></ul>
+  <div class="estado" id="estado">Carregando…</div>
+
+  <footer>Varredura automática a cada poucos minutos · ordenado por relevância.</footer>
+</div>
+
+<script>
+  var CORES = {
+    "Mercado/Economia":"#1f8a4c",
+    "Política BR":"#a06010",
+    "Mundo/Guerra":"#b1361f",
+    "Futebol":"#1d4ed8",
+    "Celebridades/Fofoca":"#7b3aa0",
+    "Brasil Geral":"#555"
+  };
+  var FILTROS = ["Todas","Mercado/Economia","Política BR","Mundo/Guerra","Futebol","Celebridades/Fofoca"];
+  var dados = [];
+  var filtro = "Todas";
+
+  function tempo(m){
+    m = Math.max(0, m||0);
+    if(m < 1) return "agora";
+    if(m < 60) return "há " + m + " min";
+    var h = Math.floor(m/60);
+    return "há " + h + "h" + ("0"+(m%60)).slice(-2);
+  }
+  function classeScore(s){ return s>=80 ? "score alto" : s>=65 ? "score medio" : "score"; }
+  function esc(s){ return (s||"").replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
+
+  function renderFiltros(){
+    document.getElementById("filtros").innerHTML = FILTROS.map(function(f){
+      var on = f===filtro ? " class=\"on\"" : "";
+      var nome = f==="Celebridades/Fofoca" ? "Celebridades" : (f==="Política BR" ? "Política" : (f==="Mercado/Economia" ? "Mercado" : f));
+      return '<a'+on+' onclick="setFiltro(\''+f.replace(/'/g,"\\'")+'\')">'+nome+'</a>';
+    }).join("");
+  }
+  function setFiltro(f){ filtro = f; renderFiltros(); render(); }
+
+  function render(){
+    var itens = dados.filter(function(n){ return filtro==="Todas" || n.beat===filtro; });
+    var ul = document.getElementById("lista");
+    if(!itens.length){
+      ul.innerHTML = "";
+      document.getElementById("estado").textContent = "Nenhuma notícia nesta categoria agora.";
+      document.getElementById("estado").style.display = "block";
+      return;
+    }
+    document.getElementById("estado").style.display = "none";
+    ul.innerHTML = itens.map(function(n){
+      var cor = CORES[n.beat] || "#777";
+      return '<li>'
+        + '<div class="'+classeScore(n.score)+'">'+n.score+'</div>'
+        + '<div class="corpo">'
+        +   '<a class="tit" href="'+esc(n.link)+'" target="_blank" rel="noopener">'+esc(n.titulo)+'</a>'
+        +   '<div class="meta">'
+        +     '<span class="cat"><span class="dot" style="background:'+cor+'"></span>'+esc(n.beat)+'</span>'
+        +     ' &nbsp;·&nbsp; '+esc(n.fonte)+' &nbsp;·&nbsp; '+tempo(n.min)
+        +   '</div>'
+        + '</div>'
+        + '</li>';
+    }).join("");
+  }
+
+  function carregar(force){
+    var btn = document.getElementById("btn");
+    btn.disabled = true; btn.textContent = "Atualizando…";
+    if(!dados.length){ document.getElementById("estado").textContent = "Carregando…"; document.getElementById("estado").style.display="block"; }
+    fetch("/api/noticias" + (force ? "?force=1" : ""))
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        dados = d.itens || [];
+        var dt = new Date((d.atualizado||0)*1000);
+        document.getElementById("updated").textContent = "Atualizado às " + dt.toLocaleTimeString("pt-BR").slice(0,5);
+        render();
+      })
+      .catch(function(){
+        document.getElementById("estado").textContent = "Não consegui carregar agora. Tente de novo em instantes.";
+        document.getElementById("estado").style.display = "block";
+      })
+      .then(function(){ btn.disabled = false; btn.textContent = "Atualizar"; });
+  }
+
+  renderFiltros();
+  carregar(false);
+  setInterval(function(){ carregar(false); }, 180000); // atualiza sozinho a cada 3 min
+</script>
+</body>
+</html>
