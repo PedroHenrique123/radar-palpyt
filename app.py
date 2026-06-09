@@ -27,6 +27,12 @@ import feedparser
 import requests
 from flask import Flask, jsonify, send_file, request
 
+try:
+    from flask_cors import CORS
+    _HAS_CORS = True
+except Exception:
+    _HAS_CORS = False
+
 # ============================================================
 #  CONFIGURACAO  (mexa so aqui)
 # ============================================================
@@ -315,6 +321,8 @@ def minerar(force=False):
 #  SERVIDOR WEB
 # ============================================================
 app = Flask(__name__)
+if _HAS_CORS:
+    CORS(app)  # libera o consumo das APIs por outros sites (ex.: Lovable)
 
 
 @app.route("/")
@@ -364,10 +372,29 @@ def api_historico():
             status = "sem_votos"
         else:
             status = "empate"
-        out.append({"titulo": titulo, "beat": beat, "score": score, "ts": ts,
-                    "link": link or "", "ap": ap, "rj": rj, "status": status})
+        out.append({"chave": chave, "titulo": titulo, "beat": beat, "score": score,
+                    "ts": ts, "link": link or "", "ap": ap, "rj": rj, "status": status})
     con.close()
     return jsonify({"total": len(out), "itens": out})
+
+
+@app.route("/api/voto", methods=["POST"])
+def api_voto():
+    body = request.get_json(force=True, silent=True) or {}
+    chave = body.get("chave")
+    if not chave:
+        return jsonify({"erro": "campo 'chave' é obrigatório"}), 400
+    aprovar = str(body.get("voto", "")).lower() in ("1", "ap", "aprovar", "aprovado", "sim", "true")
+    voto = 1 if aprovar else -1
+    usuario = str(body.get("usuario") or "web")
+    con = _db()
+    con.execute("INSERT OR REPLACE INTO votos VALUES (?,?,?,?,?)",
+                (chave, usuario, voto, usuario, int(time.time())))
+    con.commit()
+    con.close()
+    _recompute_aprendizado()
+    ap, rj = _contagem(chave)
+    return jsonify({"ok": True, "chave": chave, "ap": ap, "rj": rj})
 
 
 @app.route("/telegram/setup")
