@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Palpyt Radar - servico web
-Minera noticias por RSS, calcula relevancia, serve o painel e a API,
-e (opcional) empurra as quentes pro Telegram.
+Palpyt Radar - servico web + aprovacao no grupo do Telegram + aprendizado.
+
+- Minera noticias por RSS e pontua a relevancia.
+- Posta as quentes no grupo do Telegram com botoes Aprovar/Rejeitar.
+- Cada voto ajusta os pesos (categorias e palavras) -> as proximas noticias
+  ficam mais alinhadas ao gosto da equipe.
+- Serve tambem o painel web e a API.
 
 Rodar local:   pip install -r requirements.txt  ->  python app.py
-Abrir:         http://localhost:5000
 """
 
 import os
 import time
 import html
 import re
+import json
 import calendar
 import sqlite3
 import hashlib
@@ -26,13 +30,18 @@ from flask import Flask, jsonify, send_file, request
 # ============================================================
 #  CONFIGURACAO  (mexa so aqui)
 # ============================================================
-TELEGRAM_TOKEN   = os.environ.get("PALPYT_TG_TOKEN", "")   # opcional
-TELEGRAM_CHAT_ID = os.environ.get("PALPYT_TG_CHAT",  "")   # opcional
+TELEGRAM_TOKEN   = os.environ.get("PALPYT_TG_TOKEN", "")   # token do @BotFather
+TELEGRAM_CHAT_ID = os.environ.get("PALPYT_TG_CHAT",  "")   # id do GRUPO (negativo)
+TELEGRAM_SECRET  = os.environ.get("PALPYT_TG_SECRET", "")  # opcional, protege o webhook
 
-INTERVALO_MIN = 5      # varredura automatica de fundo (minutos)
-CACHE_MIN     = 4      # nao re-minera mais rapido que isso ao receber visitas
-JANELA_HORAS  = 3      # ignora noticias mais velhas que isso
-SCORE_TELEGRAM = 60    # so manda no Telegram acima desse calor
+INTERVALO_MIN  = 5     # varredura automatica de fundo (minutos)
+CACHE_MIN      = 4     # nao re-minera mais rapido que isso ao receber visitas
+JANELA_HORAS   = 3     # ignora noticias mais velhas que isso
+SCORE_TELEGRAM = 60    # so manda no grupo acima dessa relevancia
+
+# aprendizado por feedback
+APRENDIZADO_PASSO = 3   # quanto cada voto move o peso de uma caracteristica
+APRENDIZADO_MAX   = 30  # limite do ajuste aprendido (pra nao "explodir")
 
 BEATS = [
     {"nome": "Mercado/Economia", "prioridade": 12,
@@ -58,8 +67,9 @@ PALAVRAS_QUENTES = {
     "renúncia": 18, "renuncia": 18, "preso": 16, "presa": 16, "prisão": 16,
     "demitido": 14, "afastado": 12, "recorde": 12, "histórico": 10,
     "polêmica": 10, "escândalo": 16, "denúncia": 12, "dispara": 12,
-    "despenca": 14, "surpresa": 10, "inédito": 10,
+    "despenca": 14, "surpresa": 10, "inédito": 10, "liberado": 8, "vence": 8,
 }
+VOCAB = set(PALAVRAS_QUENTES.keys())
 
 FEEDS_DIRETOS = {
     "InfoMoney":  "https://www.infomoney.com.br/feed/",
@@ -69,18 +79,30 @@ FEEDS_DIRETOS = {
 DB_PATH = os.environ.get("PALPYT_DB", "palpyt_radar.db")
 
 # ============================================================
-#  MOTOR
+#  BANCO
 # ============================================================
 _lock = threading.Lock()
 _cache = {"ts": 0, "items": []}
+_AJUSTES = {}   # feature -> ajuste aprendido (em memoria)
 
 
 def _db():
     con = sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS vistos (id TEXT PRIMARY KEY, ts INTEGER)")
+    con.execute("""CREATE TABLE IF NOT EXISTS noticias_enviadas
+                   (chave TEXT PRIMARY KEY, titulo TEXT, beat TEXT,
+                    keywords TEXT, score INTEGER, ts INTEGER)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS votos
+                   (chave TEXT, user_id INTEGER, voto INTEGER, nome TEXT, ts INTEGER,
+                    PRIMARY KEY (chave, user_id))""")
+    con.execute("""CREATE TABLE IF NOT EXISTS aprendizado
+                   (feature TEXT PRIMARY KEY, ajuste REAL, saldo INTEGER)""")
     return con
 
 
+# ============================================================
+#  MOTOR DE MINERACAO
+# ============================================================
 def gnews_url(query):
     if "when:" not in query:
         query += " when:2h"
@@ -109,7 +131,17 @@ def _fonte(entry, fallback):
     return fallback
 
 
-def _calor(titulo, minutos, prioridade):
+def _features(titulo, beat):
+    """Caracteristicas da noticia que o aprendizado observa."""
+    t = titulo.lower()
+    feats = ["beat:" + beat]
+    for w in VOCAB:
+        if w in t:
+            feats.append("kw:" + w)
+    return feats
+
+
+def _calor_base(titulo, minutos, prioridade):
     score = 30 + prioridade
     if minutos is None:
         score += 5
@@ -125,7 +157,7 @@ def _calor(titulo, minutos, prioridade):
         score += 3
     t = titulo.lower()
     score += min(sum(p for w, p in PALAVRAS_QUENTES.items() if w in t), 30)
-    return max(0, min(100, score))
+    return score
 
 
 def _coletar():
@@ -150,40 +182,114 @@ def _coletar():
             mins = (agora - ep) / 60.0 if ep else None
             if mins is not None and mins > JANELA_HORAS * 60:
                 continue
-            score = _calor(titulo, mins, prioridade)
+            feats = _features(titulo, nome)
+            base = _calor_base(titulo, mins, prioridade)
+            aprendido = sum(_AJUSTES.get(f, 0) for f in feats)
+            score = max(0, min(100, int(base + aprendido)))
             chave = _chave(titulo)
             atual = achadas.get(chave)
             if atual and atual["score"] >= score:
                 continue
             achadas[chave] = {
                 "titulo": titulo, "link": link, "fonte": _fonte(entry, nome),
-                "beat": nome, "epoch": ep or int(agora), "score": score, "chave": chave,
+                "beat": nome, "epoch": ep or int(agora), "score": score,
+                "chave": chave, "feats": feats,
             }
-    itens = sorted(achadas.values(), key=lambda x: x["score"], reverse=True)
-    return itens[:45]
+    return sorted(achadas.values(), key=lambda x: x["score"], reverse=True)[:45]
 
 
-def _enviar_telegram(itens_novos):
+# ============================================================
+#  TELEGRAM
+# ============================================================
+def _tg(method, payload):
+    if not TELEGRAM_TOKEN:
+        return {}
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+                          json=payload, timeout=15)
+        return r.json()
+    except Exception as e:
+        print(f"[aviso] telegram {method}: {e}")
+        return {}
+
+
+def _teclado(chave, ap=0, rj=0):
+    txa = f"Aprovar ✅ ({ap})" if ap else "Aprovar ✅"
+    txr = f"Rejeitar ❌ ({rj})" if rj else "Rejeitar ❌"
+    return {"inline_keyboard": [[
+        {"text": txa, "callback_data": "ap|" + chave},
+        {"text": txr, "callback_data": "rj|" + chave},
+    ]]}
+
+
+def _enviar_telegram(itens):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
-    for n in itens_novos:
-        texto = (f"🔥 {n['beat']} (relevância {n['score']})\n\n"
+    for n in itens:
+        con = _db()
+        con.execute("INSERT OR REPLACE INTO noticias_enviadas VALUES (?,?,?,?,?,?)",
+                    (n["chave"], n["titulo"], n["beat"], json.dumps(n["feats"]),
+                     n["score"], int(time.time())))
+        con.commit()
+        con.close()
+        texto = (f"{n['beat']}  (relevância {n['score']})\n\n"
                  f"{n['titulo']}\n\n{n['fonte']}\n{n['link']}")
+        _tg("sendMessage", {
+            "chat_id": TELEGRAM_CHAT_ID, "text": texto,
+            "reply_markup": _teclado(n["chave"]),
+            "disable_web_page_preview": False,
+        })
+
+
+def _contagem(chave):
+    con = _db()
+    ap = con.execute("SELECT COUNT(*) FROM votos WHERE chave=? AND voto>0", (chave,)).fetchone()[0]
+    rj = con.execute("SELECT COUNT(*) FROM votos WHERE chave=? AND voto<0", (chave,)).fetchone()[0]
+    con.close()
+    return ap, rj
+
+
+# ============================================================
+#  APRENDIZADO POR FEEDBACK
+# ============================================================
+def _load_ajustes():
+    global _AJUSTES
+    con = _db()
+    rows = con.execute("SELECT feature, ajuste FROM aprendizado").fetchall()
+    con.close()
+    _AJUSTES = {f: a for f, a in rows}
+
+
+def _recompute_aprendizado():
+    """Recalcula os pesos do zero a partir de todos os votos (idempotente)."""
+    con = _db()
+    rows = con.execute("""SELECT n.keywords, v.voto FROM votos v
+                          JOIN noticias_enviadas n ON n.chave = v.chave""").fetchall()
+    tally = {}
+    for kw_json, voto in rows:
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": texto},
-                timeout=15)
-        except Exception as e:
-            print(f"[aviso] telegram: {e}")
+            feats = json.loads(kw_json)
+        except Exception:
+            feats = []
+        for f in feats:
+            tally[f] = tally.get(f, 0) + (1 if voto > 0 else -1)
+    con.execute("DELETE FROM aprendizado")
+    for f, saldo in tally.items():
+        aj = max(-APRENDIZADO_MAX, min(APRENDIZADO_MAX, APRENDIZADO_PASSO * saldo))
+        con.execute("INSERT INTO aprendizado VALUES (?,?,?)", (f, aj, saldo))
+    con.commit()
+    con.close()
+    _load_ajustes()
 
 
+# ============================================================
+#  CICLO PRINCIPAL
+# ============================================================
 def minerar(force=False):
     with _lock:
         if not force and (time.time() - _cache["ts"]) < CACHE_MIN * 60 and _cache["items"]:
             return _cache["items"]
         itens = _coletar()
-        # detecta novidades quentes para o Telegram
         con = _db()
         novos = []
         for n in itens:
@@ -216,8 +322,7 @@ def home():
 
 @app.route("/api/noticias")
 def api_noticias():
-    force = request.args.get("force") == "1"
-    itens = minerar(force=force)
+    itens = minerar(force=request.args.get("force") == "1")
     agora = time.time()
     saida = [{
         "titulo": n["titulo"], "link": n["link"], "fonte": n["fonte"],
@@ -227,7 +332,59 @@ def api_noticias():
     return jsonify({"atualizado": int(agora), "total": len(saida), "itens": saida})
 
 
-# varredura de fundo (mantem Telegram funcionando mesmo sem ninguem no painel)
+@app.route("/api/aprendizado")
+def api_aprendizado():
+    """Transparencia: o que a equipe ensinou ate agora."""
+    itens = sorted(_AJUSTES.items(), key=lambda x: x[1], reverse=True)
+    fmt = [{"caracteristica": f, "ajuste": round(a, 1)} for f, a in itens]
+    return jsonify({"pesos": fmt})
+
+
+@app.route("/telegram/setup")
+def tg_setup():
+    if not TELEGRAM_TOKEN:
+        return "Configure PALPYT_TG_TOKEN primeiro.", 400
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    payload = {"url": f"https://{host}/telegram/webhook",
+               "allowed_updates": ["callback_query", "message"]}
+    if TELEGRAM_SECRET:
+        payload["secret_token"] = TELEGRAM_SECRET
+    return jsonify(_tg("setWebhook", payload))
+
+
+@app.route("/telegram/webhook", methods=["POST"])
+def tg_webhook():
+    if TELEGRAM_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET:
+        return "forbidden", 403
+    upd = request.get_json(force=True, silent=True) or {}
+    cq = upd.get("callback_query")
+    if cq:
+        data = cq.get("data", "")
+        msg = cq.get("message", {}) or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        msg_id = msg.get("message_id")
+        frm = cq.get("from", {}) or {}
+        if "|" in data:
+            acao, chave = data.split("|", 1)
+            voto = 1 if acao == "ap" else -1
+            con = _db()
+            con.execute("INSERT OR REPLACE INTO votos VALUES (?,?,?,?,?)",
+                        (chave, frm.get("id"), voto, frm.get("first_name", ""), int(time.time())))
+            con.commit()
+            con.close()
+            _recompute_aprendizado()
+            ap, rj = _contagem(chave)
+            if chat_id and msg_id:
+                _tg("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": msg_id,
+                                               "reply_markup": _teclado(chave, ap, rj)})
+            _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
+                                        "text": "Voto registrado. Obrigado!"})
+    return jsonify({"ok": True})
+
+
+# ============================================================
+#  VARREDURA DE FUNDO + START
+# ============================================================
 def _loop():
     while True:
         try:
@@ -238,13 +395,12 @@ def _loop():
 
 
 def _start_bg():
-    if os.environ.get("PALPYT_NO_BG") == "1":
-        return
-    threading.Thread(target=_loop, daemon=True).start()
+    _load_ajustes()
+    if os.environ.get("PALPYT_NO_BG") != "1":
+        threading.Thread(target=_loop, daemon=True).start()
 
 
 _start_bg()
 
 if __name__ == "__main__":
-    porta = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=porta, use_reloader=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), use_reloader=False)
