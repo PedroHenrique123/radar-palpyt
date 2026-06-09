@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Palpyt — Aprovações</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:#222; background:#fafafa; margin:0; line-height:1.45; font-size:15px;}
+  .container{max-width:860px; margin:0 auto; padding:0 18px 50px;}
+
+  header{display:flex; align-items:baseline; justify-content:space-between; gap:14px;
+    flex-wrap:wrap; border-bottom:1px solid #e2e2e2; padding:18px 0 14px;}
+  .brand{font-size:18px; font-weight:700; color:#111;}
+  .brand span{font-weight:400; color:#777; font-size:14px; margin-left:8px;}
+  .head-right{display:flex; align-items:center; gap:14px; font-size:13px; color:#777;}
+  .head-right a{color:#555; text-decoration:none;}
+  button{font-family:inherit; font-size:13px; color:#222; background:#fff; cursor:pointer;
+    border:1px solid #ccc; border-radius:4px; padding:6px 12px;}
+  button:hover{background:#f0f0f0;}
+
+  .stats{display:flex; gap:22px; flex-wrap:wrap; padding:16px 2px 4px; font-size:14px;}
+  .stats b{font-size:20px; font-weight:700; display:block; color:#111;}
+  .stats .lbl{color:#888; font-size:12.5px;}
+  .stats .ap b{color:#1f8a4c;} .stats .rj b{color:#b1361f;}
+
+  .secao{font-size:12.5px; color:#999; text-transform:uppercase; letter-spacing:.5px;
+    margin:22px 2px 8px; border-bottom:1px solid #ececec; padding-bottom:6px;}
+
+  table.cat{width:100%; border-collapse:collapse; font-size:14px;}
+  table.cat td, table.cat th{text-align:left; padding:7px 4px; border-bottom:1px solid #f0f0f0;}
+  table.cat th{font-weight:600; color:#666; font-size:12.5px;}
+  table.cat td.n{text-align:right; font-variant-numeric:tabular-nums; width:70px;}
+  .dot{width:7px; height:7px; border-radius:50%; display:inline-block; margin-right:6px;}
+
+  .filtros{display:flex; gap:16px; flex-wrap:wrap; padding:10px 0 4px; font-size:13px;}
+  .filtros a{color:#555; text-decoration:none; cursor:pointer; padding-bottom:2px;}
+  .filtros a:hover{color:#111;}
+  .filtros a.on{color:#111; font-weight:600; border-bottom:2px solid #444;}
+  .flabel{color:#aaa; font-size:12px; align-self:center; margin-right:-8px;}
+
+  ul{list-style:none; margin:0; padding:0;}
+  li{display:flex; gap:14px; align-items:flex-start; padding:13px 2px; border-bottom:1px solid #ececec;}
+  li:hover{background:#f5f5f5;}
+  .votos{flex:0 0 84px; font-size:13px; color:#666; font-variant-numeric:tabular-nums;}
+  .votos .a{color:#1f8a4c;} .votos .r{color:#b1361f;}
+  .corpo{flex:1; min-width:0;}
+  .corpo a.tit, .corpo .tit{color:#1a1a1a; text-decoration:none; font-weight:600; font-size:15px;}
+  .corpo a.tit:hover{text-decoration:underline;}
+  .meta{font-size:12.5px; color:#888; margin-top:3px;}
+  .cat-tag{display:inline-flex; align-items:center;}
+  .st{flex:0 0 92px; text-align:right; font-size:12px;}
+  .badge{display:inline-block; padding:2px 8px; border-radius:4px; font-size:11.5px; font-weight:600;}
+  .badge.aprovada{background:#e7f3ea; color:#1f6b3c;}
+  .badge.rejeitada{background:#f7e7e4; color:#9a2f1c;}
+  .badge.empate{background:#f6efdc; color:#8a6512;}
+  .badge.sem_votos{background:#eee; color:#888;}
+
+  .estado{padding:26px 2px; color:#888; font-size:14px;}
+  footer{margin-top:24px; font-size:12px; color:#999;}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <div class="brand">Palpyt <span>Aprovações</span></div>
+    <div class="head-right">
+      <a href="/">Painel</a>
+      <button onclick="carregar()">Atualizar</button>
+    </div>
+  </header>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="secao">Por categoria</div>
+  <table class="cat"><thead><tr><th>Categoria</th><th class="n">Aprovadas</th><th class="n">Rejeitadas</th><th class="n">Total</th></tr></thead>
+  <tbody id="catbody"></tbody></table>
+
+  <div class="secao">Mensagens</div>
+  <div class="filtros" id="fcat"></div>
+  <div class="filtros" id="fstatus"></div>
+
+  <ul id="lista"></ul>
+  <div class="estado" id="estado">Carregando…</div>
+
+  <footer>Histórico das notícias enviadas ao grupo e os votos da equipe.</footer>
+</div>
+
+<script>
+  var CORES = {
+    "Mercado/Economia":"#1f8a4c","Política BR":"#a06010","Mundo/Guerra":"#b1361f",
+    "Futebol":"#1d4ed8","Celebridades/Fofoca":"#7b3aa0","Brasil Geral":"#555"
+  };
+  var FCAT = ["Todas","Mercado/Economia","Política BR","Mundo/Guerra","Futebol","Celebridades/Fofoca"];
+  var FSTATUS = [["Todas","todas"],["Aprovadas","aprovada"],["Rejeitadas","rejeitada"],["Sem votos","sem_votos"]];
+  var STLABEL = {aprovada:"Aprovada",rejeitada:"Rejeitada",empate:"Empate",sem_votos:"Sem votos"};
+  var dados = [], fcat="Todas", fstatus="todas";
+
+  function esc(s){ return (s||"").replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
+  function curto(b){ return b==="Celebridades/Fofoca"?"Celebridades":(b==="Política BR"?"Política":(b==="Mercado/Economia"?"Mercado":b)); }
+  function data(ts){ var d=new Date(ts*1000); var p=function(n){return ("0"+n).slice(-2);};
+    return p(d.getDate())+"/"+p(d.getMonth()+1)+" "+p(d.getHours())+":"+p(d.getMinutes()); }
+
+  function renderStats(){
+    var ap=dados.filter(function(n){return n.status==="aprovada";}).length;
+    var rj=dados.filter(function(n){return n.status==="rejeitada";}).length;
+    var sv=dados.filter(function(n){return n.status==="sem_votos";}).length;
+    document.getElementById("stats").innerHTML =
+      '<div><b>'+dados.length+'</b><span class="lbl">enviadas</span></div>'
+      +'<div class="ap"><b>'+ap+'</b><span class="lbl">aprovadas</span></div>'
+      +'<div class="rj"><b>'+rj+'</b><span class="lbl">rejeitadas</span></div>'
+      +'<div><b>'+sv+'</b><span class="lbl">sem votos</span></div>';
+  }
+
+  function renderCategorias(){
+    var g={};
+    dados.forEach(function(n){
+      if(!g[n.beat]) g[n.beat]={ap:0,rj:0,tot:0};
+      g[n.beat].tot++;
+      if(n.status==="aprovada") g[n.beat].ap++;
+      if(n.status==="rejeitada") g[n.beat].rj++;
+    });
+    var linhas=Object.keys(g).sort(function(a,b){return g[b].tot-g[a].tot;}).map(function(b){
+      var cor=CORES[b]||"#777";
+      return '<tr><td><span class="cat-tag"><span class="dot" style="background:'+cor+'"></span>'+esc(b)+'</span></td>'
+        +'<td class="n" style="color:#1f8a4c">'+g[b].ap+'</td>'
+        +'<td class="n" style="color:#b1361f">'+g[b].rj+'</td>'
+        +'<td class="n">'+g[b].tot+'</td></tr>';
+    }).join("");
+    document.getElementById("catbody").innerHTML = linhas || '<tr><td colspan="4" style="color:#999;padding:12px 4px">Sem dados ainda.</td></tr>';
+  }
+
+  function renderFiltros(){
+    document.getElementById("fcat").innerHTML = '<span class="flabel">Categoria:</span> '
+      + FCAT.map(function(f){return '<a class="'+(f===fcat?'on':'')+'" onclick="setCat(\''+f.replace(/'/g,"\\'")+'\')">'+curto(f)+'</a>';}).join("");
+    document.getElementById("fstatus").innerHTML = '<span class="flabel">Situação:</span> '
+      + FSTATUS.map(function(p){return '<a class="'+(p[1]===fstatus?'on':'')+'" onclick="setStatus(\''+p[1]+'\')">'+p[0]+'</a>';}).join("");
+  }
+  function setCat(c){ fcat=c; renderFiltros(); renderLista(); }
+  function setStatus(s){ fstatus=s; renderFiltros(); renderLista(); }
+
+  function renderLista(){
+    var itens = dados.filter(function(n){
+      return (fcat==="Todas"||n.beat===fcat) && (fstatus==="todas"||n.status===fstatus);
+    });
+    var ul=document.getElementById("lista"), est=document.getElementById("estado");
+    if(!itens.length){ ul.innerHTML=""; est.textContent="Nenhuma mensagem com esse filtro."; est.style.display="block"; return; }
+    est.style.display="none";
+    ul.innerHTML = itens.map(function(n){
+      var cor=CORES[n.beat]||"#777";
+      var titulo = n.link
+        ? '<a class="tit" href="'+esc(n.link)+'" target="_blank" rel="noopener">'+esc(n.titulo)+'</a>'
+        : '<span class="tit">'+esc(n.titulo)+'</span>';
+      return '<li>'
+        + '<div class="votos"><span class="a">✓ '+n.ap+'</span> &nbsp; <span class="r">✗ '+n.rj+'</span></div>'
+        + '<div class="corpo">'+titulo
+        +   '<div class="meta"><span class="cat-tag"><span class="dot" style="background:'+cor+'"></span>'+esc(n.beat)+'</span>'
+        +   ' &nbsp;·&nbsp; relevância '+n.score+' &nbsp;·&nbsp; '+data(n.ts)+'</div></div>'
+        + '<div class="st"><span class="badge '+n.status+'">'+STLABEL[n.status]+'</span></div>'
+        + '</li>';
+    }).join("");
+  }
+
+  function carregar(){
+    document.getElementById("estado").textContent="Carregando…";
+    document.getElementById("estado").style.display="block";
+    fetch("/api/historico").then(function(r){return r.json();}).then(function(d){
+      dados = d.itens || [];
+      renderStats(); renderCategorias(); renderFiltros(); renderLista();
+    }).catch(function(){
+      document.getElementById("estado").textContent="Não consegui carregar agora. Tente de novo em instantes.";
+    });
+  }
+
+  renderFiltros();
+  carregar();
+</script>
+</body>
+</html>

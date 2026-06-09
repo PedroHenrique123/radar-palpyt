@@ -91,7 +91,7 @@ def _db():
     con.execute("CREATE TABLE IF NOT EXISTS vistos (id TEXT PRIMARY KEY, ts INTEGER)")
     con.execute("""CREATE TABLE IF NOT EXISTS noticias_enviadas
                    (chave TEXT PRIMARY KEY, titulo TEXT, beat TEXT,
-                    keywords TEXT, score INTEGER, ts INTEGER)""")
+                    keywords TEXT, score INTEGER, ts INTEGER, link TEXT)""")
     con.execute("""CREATE TABLE IF NOT EXISTS votos
                    (chave TEXT, user_id INTEGER, voto INTEGER, nome TEXT, ts INTEGER,
                     PRIMARY KEY (chave, user_id))""")
@@ -227,9 +227,11 @@ def _enviar_telegram(itens):
         return
     for n in itens:
         con = _db()
-        con.execute("INSERT OR REPLACE INTO noticias_enviadas VALUES (?,?,?,?,?,?)",
+        con.execute("""INSERT OR REPLACE INTO noticias_enviadas
+                       (chave, titulo, beat, keywords, score, ts, link)
+                       VALUES (?,?,?,?,?,?,?)""",
                     (n["chave"], n["titulo"], n["beat"], json.dumps(n["feats"]),
-                     n["score"], int(time.time())))
+                     n["score"], int(time.time()), n.get("link", "")))
         con.commit()
         con.close()
         texto = (f"{n['beat']}  (relevância {n['score']})\n\n"
@@ -340,6 +342,34 @@ def api_aprendizado():
     return jsonify({"pesos": fmt})
 
 
+@app.route("/historico")
+def historico():
+    return send_file("historico.html")
+
+
+@app.route("/api/historico")
+def api_historico():
+    con = _db()
+    rows = con.execute("""SELECT chave, titulo, beat, score, ts, link
+                          FROM noticias_enviadas ORDER BY ts DESC LIMIT 300""").fetchall()
+    out = []
+    for chave, titulo, beat, score, ts, link in rows:
+        ap = con.execute("SELECT COUNT(*) FROM votos WHERE chave=? AND voto>0", (chave,)).fetchone()[0]
+        rj = con.execute("SELECT COUNT(*) FROM votos WHERE chave=? AND voto<0", (chave,)).fetchone()[0]
+        if ap > rj:
+            status = "aprovada"
+        elif rj > ap:
+            status = "rejeitada"
+        elif ap == 0 and rj == 0:
+            status = "sem_votos"
+        else:
+            status = "empate"
+        out.append({"titulo": titulo, "beat": beat, "score": score, "ts": ts,
+                    "link": link or "", "ap": ap, "rj": rj, "status": status})
+    con.close()
+    return jsonify({"total": len(out), "itens": out})
+
+
 @app.route("/telegram/setup")
 def tg_setup():
     if not TELEGRAM_TOKEN:
@@ -394,7 +424,18 @@ def _loop():
         time.sleep(INTERVALO_MIN * 60)
 
 
+def _migrate():
+    con = _db()
+    try:
+        con.execute("ALTER TABLE noticias_enviadas ADD COLUMN link TEXT")
+        con.commit()
+    except Exception:
+        pass
+    con.close()
+
+
 def _start_bg():
+    _migrate()
     _load_ajustes()
     if os.environ.get("PALPYT_NO_BG") != "1":
         threading.Thread(target=_loop, daemon=True).start()
