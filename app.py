@@ -86,6 +86,12 @@ FEEDS_DIRETOS = [
     {"nome": "Leo Dias",   "url": "https://portalleodias.com/feed/", "prioridade": 10, "janela": 48},
 ]
 
+# Choquei via Instagram->RSS (ex.: RSS.app). Cole a URL do feed na variavel de
+# ambiente PALPYT_CHOQUEI_FEED no Render. Se ficar vazia, a fonte e ignorada.
+_choquei_feed = os.environ.get("PALPYT_CHOQUEI_FEED", "")
+if _choquei_feed:
+    FEEDS_DIRETOS.append({"nome": "Choquei", "url": _choquei_feed, "prioridade": 10, "janela": 48})
+
 DB_PATH = os.environ.get("PALPYT_DB", "palpyt_radar.db")
 
 # ============================================================
