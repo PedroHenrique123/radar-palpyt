@@ -96,12 +96,16 @@ _choquei_feed = os.environ.get("PALPYT_CHOQUEI_FEED", "")
 if _choquei_feed:
     FEEDS_DIRETOS.append({"nome": "Choquei", "url": _choquei_feed, "prioridade": 10, "janela": 48})
 
+# Fontes dedicadas: nunca cortadas por tempo nem por limite (voce quer ver tudo delas).
+SEMPRE_BEATS = {"Leo Dias", "Choquei"}
+
 # ============================================================
 #  BANCO (PostgreSQL)
 # ============================================================
 _lock = threading.Lock()
 _cache = {"ts": 0, "items": []}
 _AJUSTES = {}
+_DIAG = {"fontes": [], "contagem": {}}
 
 
 def _conn():
@@ -236,7 +240,7 @@ def _coletar():
                 continue
             ep = _epoch(entry)
             mins = (agora - ep) / 60.0 if ep else None
-            if mins is not None and mins > janela * 60:
+            if nome not in SEMPRE_BEATS and mins is not None and mins > janela * 60:
                 continue
             feats = _features(titulo, nome)
             base = _calor_base(titulo, mins, prioridade)
@@ -251,7 +255,15 @@ def _coletar():
                 "beat": nome, "epoch": ep or int(agora), "score": score,
                 "chave": chave, "feats": feats,
             }
-    return sorted(achadas.values(), key=lambda x: x["score"], reverse=True)[:80]
+    itens = sorted(achadas.values(), key=lambda x: x["score"], reverse=True)
+    cont = {}
+    for n in itens:
+        cont[n["beat"]] = cont.get(n["beat"], 0) + 1
+    _DIAG["fontes"] = [b["nome"] for b in BEATS] + [f["nome"] for f in FEEDS_DIRETOS]
+    _DIAG["contagem"] = cont
+    sempre = [n for n in itens if n["beat"] in SEMPRE_BEATS]
+    resto = [n for n in itens if n["beat"] not in SEMPRE_BEATS][:80]
+    return sorted(sempre + resto, key=lambda x: x["score"], reverse=True)
 
 
 # ============================================================
@@ -445,6 +457,12 @@ def api_historico():
 def api_aprendizado():
     itens = sorted(_AJUSTES.items(), key=lambda x: x[1], reverse=True)
     return jsonify({"pesos": [{"caracteristica": f, "ajuste": round(a, 1)} for f, a in itens]})
+
+
+@app.route("/api/fontes")
+def api_fontes():
+    """Diagnostico: fontes configuradas e quantos itens cada uma trouxe na ultima varredura."""
+    return jsonify(_DIAG)
 
 
 @app.route("/api/voto", methods=["POST"])
