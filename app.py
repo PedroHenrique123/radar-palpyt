@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Palpyt Radar - servico web + aprovacao no grupo do Telegram + aprendizado.
+Palpyt Radar - servico web (PostgreSQL / Neon).
 
 - Minera noticias por RSS e pontua a relevancia.
 - Posta as quentes no grupo do Telegram com botoes Aprovar/Rejeitar.
-- Cada voto ajusta os pesos (categorias e palavras) -> as proximas noticias
-  ficam mais alinhadas ao gosto da equipe.
-- Serve tambem o painel web e a API.
+- 1o voto DECIDE e trava; aprovados sao encaminhados para a equipe de postagem.
+- Aprendizado por feedback (cada decisao conta uma vez).
+- Serve o painel, a pagina de aprovacoes e as APIs.
 
-Rodar local:   pip install -r requirements.txt  ->  python app.py
+Persistencia em Postgres: defina a variavel de ambiente DATABASE_URL com a
+string de conexao do Neon (ou outro Postgres). Assim os dados NAO se perdem
+quando o Render reinicia/reimplanta.
+
+Rodar local:  pip install -r requirements.txt
+              (defina DATABASE_URL)  ->  python app.py
 """
 
 import os
@@ -18,13 +23,12 @@ import html
 import re
 import json
 import calendar
-import sqlite3
-import hashlib
 import threading
 from urllib.parse import quote_plus
 
 import feedparser
 import requests
+import psycopg2
 from flask import Flask, jsonify, send_file, request
 
 try:
@@ -36,19 +40,20 @@ except Exception:
 # ============================================================
 #  CONFIGURACAO  (mexa so aqui)
 # ============================================================
+DATABASE_URL = os.environ.get("DATABASE_URL", "")          # Postgres (Neon)
+
 TELEGRAM_TOKEN   = os.environ.get("PALPYT_TG_TOKEN", "")   # token do @BotFather
-TELEGRAM_CHAT_ID = os.environ.get("PALPYT_TG_CHAT",  "")   # id do GRUPO de curadoria (negativo)
+TELEGRAM_CHAT_ID = os.environ.get("PALPYT_TG_CHAT",  "")   # id do GRUPO de curadoria
 TELEGRAM_SECRET  = os.environ.get("PALPYT_TG_SECRET", "")  # opcional, protege o webhook
-TELEGRAM_POSTAGEM_CHAT = os.environ.get("PALPYT_TG_POSTAGEM", "")  # grupo que recebe os aprovados
+TELEGRAM_POSTAGEM_CHAT = os.environ.get("PALPYT_TG_POSTAGEM", "")  # grupo dos aprovados
 
 INTERVALO_MIN  = 5     # varredura automatica de fundo (minutos)
 CACHE_MIN      = 4     # nao re-minera mais rapido que isso ao receber visitas
-JANELA_HORAS   = 3     # ignora noticias mais velhas que isso
+JANELA_HORAS   = 3     # idade maxima padrao das noticias
 SCORE_TELEGRAM = 60    # so manda no grupo acima dessa relevancia
 
-# aprendizado por feedback
-APRENDIZADO_PASSO = 3   # quanto cada voto move o peso de uma caracteristica
-APRENDIZADO_MAX   = 30  # limite do ajuste aprendido (pra nao "explodir")
+APRENDIZADO_PASSO = 3   # quanto cada decisao move o peso de uma caracteristica
+APRENDIZADO_MAX   = 30  # limite do ajuste aprendido
 
 BEATS = [
     {"nome": "Mercado/Economia", "prioridade": 12,
@@ -86,35 +91,69 @@ FEEDS_DIRETOS = [
     {"nome": "Leo Dias",   "url": "https://portalleodias.com/feed/", "prioridade": 10, "janela": 48},
 ]
 
-# Choquei via Instagram->RSS (ex.: RSS.app). Cole a URL do feed na variavel de
-# ambiente PALPYT_CHOQUEI_FEED no Render. Se ficar vazia, a fonte e ignorada.
+# Choquei via Instagram->RSS (ex.: RSS.app). Cole a URL na variavel PALPYT_CHOQUEI_FEED.
 _choquei_feed = os.environ.get("PALPYT_CHOQUEI_FEED", "")
 if _choquei_feed:
     FEEDS_DIRETOS.append({"nome": "Choquei", "url": _choquei_feed, "prioridade": 10, "janela": 48})
 
-DB_PATH = os.environ.get("PALPYT_DB", "palpyt_radar.db")
-
 # ============================================================
-#  BANCO
+#  BANCO (PostgreSQL)
 # ============================================================
 _lock = threading.Lock()
 _cache = {"ts": 0, "items": []}
-_AJUSTES = {}   # feature -> ajuste aprendido (em memoria)
+_AJUSTES = {}
 
 
-def _db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("CREATE TABLE IF NOT EXISTS vistos (id TEXT PRIMARY KEY, ts INTEGER)")
-    con.execute("""CREATE TABLE IF NOT EXISTS noticias_enviadas
-                   (chave TEXT PRIMARY KEY, titulo TEXT, beat TEXT,
-                    keywords TEXT, score INTEGER, ts INTEGER, link TEXT,
-                    decisao TEXT, decidido_por TEXT, decidido_em INTEGER)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS votos
-                   (chave TEXT, user_id INTEGER, voto INTEGER, nome TEXT, ts INTEGER,
-                    PRIMARY KEY (chave, user_id))""")
-    con.execute("""CREATE TABLE IF NOT EXISTS aprendizado
-                   (feature TEXT PRIMARY KEY, ajuste REAL, saldo INTEGER)""")
+def _conn():
+    con = psycopg2.connect(DATABASE_URL)
+    con.autocommit = True
     return con
+
+
+def db_exec(sql, params=()):
+    con = _conn()
+    try:
+        con.cursor().execute(sql, params)
+    finally:
+        con.close()
+
+
+def db_one(sql, params=()):
+    con = _conn()
+    try:
+        cur = con.cursor()
+        cur.execute(sql, params)
+        return cur.fetchone()
+    finally:
+        con.close()
+
+
+def db_all(sql, params=()):
+    con = _conn()
+    try:
+        cur = con.cursor()
+        cur.execute(sql, params)
+        return cur.fetchall()
+    finally:
+        con.close()
+
+
+def init_db():
+    con = _conn()
+    try:
+        cur = con.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS vistos (id TEXT PRIMARY KEY, ts BIGINT)")
+        cur.execute("""CREATE TABLE IF NOT EXISTS noticias_enviadas
+                       (chave TEXT PRIMARY KEY, titulo TEXT, beat TEXT, keywords TEXT,
+                        score INTEGER, ts BIGINT, link TEXT,
+                        decisao TEXT, decidido_por TEXT, decidido_em BIGINT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS votos
+                       (chave TEXT, user_id TEXT, voto INTEGER, nome TEXT, ts BIGINT,
+                        PRIMARY KEY (chave, user_id))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS aprendizado
+                       (feature TEXT PRIMARY KEY, ajuste DOUBLE PRECISION, saldo INTEGER)""")
+    finally:
+        con.close()
 
 
 # ============================================================
@@ -133,6 +172,7 @@ def _norm(t):
 
 
 def _chave(titulo):
+    import hashlib
     return hashlib.md5(_norm(titulo).encode("utf-8")).hexdigest()
 
 
@@ -149,7 +189,6 @@ def _fonte(entry, fallback):
 
 
 def _features(titulo, beat):
-    """Caracteristicas da noticia que o aprendizado observa."""
     t = titulo.lower()
     feats = ["beat:" + beat]
     for w in VOCAB:
@@ -230,12 +269,10 @@ def _tg(method, payload):
         return {}
 
 
-def _teclado(chave, ap=0, rj=0):
-    txa = f"Aprovar ✅ ({ap})" if ap else "Aprovar ✅"
-    txr = f"Rejeitar ❌ ({rj})" if rj else "Rejeitar ❌"
+def _teclado(chave):
     return {"inline_keyboard": [[
-        {"text": txa, "callback_data": "ap|" + chave},
-        {"text": txr, "callback_data": "rj|" + chave},
+        {"text": "Aprovar ✅", "callback_data": "ap|" + chave},
+        {"text": "Rejeitar ❌", "callback_data": "rj|" + chave},
     ]]}
 
 
@@ -243,25 +280,20 @@ def _enviar_telegram(itens):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
     for n in itens:
-        con = _db()
-        con.execute("""INSERT OR REPLACE INTO noticias_enviadas
-                       (chave, titulo, beat, keywords, score, ts, link)
-                       VALUES (?,?,?,?,?,?,?)""",
-                    (n["chave"], n["titulo"], n["beat"], json.dumps(n["feats"]),
-                     n["score"], int(time.time()), n.get("link", "")))
-        con.commit()
-        con.close()
+        db_exec("""INSERT INTO noticias_enviadas (chave,titulo,beat,keywords,score,ts,link)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (chave) DO UPDATE SET titulo=EXCLUDED.titulo, beat=EXCLUDED.beat,
+                     keywords=EXCLUDED.keywords, score=EXCLUDED.score, ts=EXCLUDED.ts, link=EXCLUDED.link""",
+                (n["chave"], n["titulo"], n["beat"], json.dumps(n["feats"]),
+                 n["score"], int(time.time()), n.get("link", "")))
         texto = (f"{n['beat']}  (relevância {n['score']})\n\n"
                  f"{n['titulo']}\n\n{n['fonte']}\n{n['link']}")
-        _tg("sendMessage", {
-            "chat_id": TELEGRAM_CHAT_ID, "text": texto,
-            "reply_markup": _teclado(n["chave"]),
-            "disable_web_page_preview": False,
-        })
+        _tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": texto,
+                            "reply_markup": _teclado(n["chave"]),
+                            "disable_web_page_preview": False})
 
 
 def _encaminhar_postagem(n, quem):
-    """Encaminha a noticia aprovada para o grupo da equipe de postagem."""
     if not (TELEGRAM_TOKEN and TELEGRAM_POSTAGEM_CHAT):
         return
     texto = (f"✅ APROVADA para postagem\n\n{n['titulo']}\n\n"
@@ -271,63 +303,68 @@ def _encaminhar_postagem(n, quem):
                         "disable_web_page_preview": False})
 
 
+# ============================================================
+#  APRENDIZADO + DECISAO
+# ============================================================
+def _load_ajustes():
+    global _AJUSTES
+    try:
+        rows = db_all("SELECT feature, ajuste FROM aprendizado")
+        _AJUSTES = {f: a for f, a in rows}
+    except Exception as e:
+        print(f"[aviso] load_ajustes: {e}")
+
+
+def _recompute_aprendizado():
+    con = _conn()
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT keywords, decisao FROM noticias_enviadas WHERE decisao IS NOT NULL")
+        rows = cur.fetchall()
+        tally = {}
+        for kw_json, decisao in rows:
+            try:
+                feats = json.loads(kw_json) if kw_json else []
+            except Exception:
+                feats = []
+            s = 1 if decisao == "aprovada" else -1
+            for f in feats:
+                tally[f] = tally.get(f, 0) + s
+        cur.execute("DELETE FROM aprendizado")
+        for f, saldo in tally.items():
+            aj = max(-APRENDIZADO_MAX, min(APRENDIZADO_MAX, APRENDIZADO_PASSO * saldo))
+            cur.execute("INSERT INTO aprendizado (feature,ajuste,saldo) VALUES (%s,%s,%s)", (f, aj, saldo))
+    finally:
+        con.close()
+    _load_ajustes()
+
+
 def _registrar_decisao(chave, aprovar, quem):
     """O PRIMEIRO voto decide e trava. Votos posteriores sao ignorados."""
-    con = _db()
-    row = con.execute("""SELECT decisao, decidido_por, titulo, beat, link, score
-                         FROM noticias_enviadas WHERE chave=?""", (chave,)).fetchone()
-    if not row:
+    con = _conn()
+    try:
+        cur = con.cursor()
+        cur.execute("""SELECT decisao, decidido_por, titulo, beat, link, score
+                       FROM noticias_enviadas WHERE chave=%s""", (chave,))
+        row = cur.fetchone()
+        if not row:
+            return {"status": "desconhecida", "ja_decidida": False, "novo": False}
+        decisao, por, titulo, beat, link, score = row
+        if decisao:
+            return {"status": decisao, "decidido_por": por, "ja_decidida": True, "novo": False}
+        nova = "aprovada" if aprovar else "rejeitada"
+        cur.execute("UPDATE noticias_enviadas SET decisao=%s, decidido_por=%s, decidido_em=%s WHERE chave=%s",
+                    (nova, quem, int(time.time()), chave))
+        cur.execute("""INSERT INTO votos (chave,user_id,voto,nome,ts) VALUES (%s,%s,%s,%s,%s)
+                       ON CONFLICT (chave,user_id) DO UPDATE SET voto=EXCLUDED.voto,
+                         nome=EXCLUDED.nome, ts=EXCLUDED.ts""",
+                    (chave, str(quem), 1 if aprovar else -1, str(quem), int(time.time())))
+    finally:
         con.close()
-        return {"status": "desconhecida", "ja_decidida": False, "novo": False}
-    decisao, por, titulo, beat, link, score = row
-    if decisao:  # ja decidida -> ignora o novo voto
-        con.close()
-        return {"status": decisao, "decidido_por": por, "ja_decidida": True, "novo": False}
-    nova = "aprovada" if aprovar else "rejeitada"
-    con.execute("UPDATE noticias_enviadas SET decisao=?, decidido_por=?, decidido_em=? WHERE chave=?",
-                (nova, quem, int(time.time()), chave))
-    con.execute("INSERT OR REPLACE INTO votos VALUES (?,?,?,?,?)",
-                (chave, quem, 1 if aprovar else -1, quem, int(time.time())))
-    con.commit()
-    con.close()
     _recompute_aprendizado()
     if nova == "aprovada":
         _encaminhar_postagem({"titulo": titulo, "beat": beat, "link": link, "score": score}, quem)
     return {"status": nova, "decidido_por": quem, "ja_decidida": False, "novo": True}
-
-
-# ============================================================
-#  APRENDIZADO POR FEEDBACK
-# ============================================================
-def _load_ajustes():
-    global _AJUSTES
-    con = _db()
-    rows = con.execute("SELECT feature, ajuste FROM aprendizado").fetchall()
-    con.close()
-    _AJUSTES = {f: a for f, a in rows}
-
-
-def _recompute_aprendizado():
-    """Recalcula os pesos: cada noticia DECIDIDA conta uma unica vez."""
-    con = _db()
-    rows = con.execute("""SELECT keywords, decisao FROM noticias_enviadas
-                          WHERE decisao IS NOT NULL""").fetchall()
-    tally = {}
-    for kw_json, decisao in rows:
-        try:
-            feats = json.loads(kw_json) if kw_json else []
-        except Exception:
-            feats = []
-        s = 1 if decisao == "aprovada" else -1
-        for f in feats:
-            tally[f] = tally.get(f, 0) + s
-    con.execute("DELETE FROM aprendizado")
-    for f, saldo in tally.items():
-        aj = max(-APRENDIZADO_MAX, min(APRENDIZADO_MAX, APRENDIZADO_PASSO * saldo))
-        con.execute("INSERT INTO aprendizado VALUES (?,?,?)", (f, aj, saldo))
-    con.commit()
-    con.close()
-    _load_ajustes()
 
 
 # ============================================================
@@ -338,18 +375,23 @@ def minerar(force=False):
         if not force and (time.time() - _cache["ts"]) < CACHE_MIN * 60 and _cache["items"]:
             return _cache["items"]
         itens = _coletar()
-        con = _db()
         novos = []
-        for n in itens:
-            if n["score"] < SCORE_TELEGRAM:
-                continue
-            if con.execute("SELECT 1 FROM vistos WHERE id=?", (n["chave"],)).fetchone():
-                continue
-            con.execute("INSERT OR IGNORE INTO vistos VALUES (?,?)", (n["chave"], int(time.time())))
-            novos.append(n)
-        con.execute("DELETE FROM vistos WHERE ts < ?", (int(time.time()) - 4 * 86400,))
-        con.commit()
-        con.close()
+        agora = int(time.time())
+        con = _conn()
+        try:
+            cur = con.cursor()
+            for n in itens:
+                if n["score"] < SCORE_TELEGRAM:
+                    continue
+                cur.execute("SELECT 1 FROM vistos WHERE id=%s", (n["chave"],))
+                if cur.fetchone():
+                    continue
+                cur.execute("INSERT INTO vistos (id, ts) VALUES (%s,%s) ON CONFLICT (id) DO NOTHING",
+                            (n["chave"], agora))
+                novos.append(n)
+            cur.execute("DELETE FROM vistos WHERE ts < %s", (agora - 4 * 86400,))
+        finally:
+            con.close()
         _cache["items"] = itens
         _cache["ts"] = time.time()
     if novos:
@@ -362,12 +404,17 @@ def minerar(force=False):
 # ============================================================
 app = Flask(__name__)
 if _HAS_CORS:
-    CORS(app)  # libera o consumo das APIs por outros sites (ex.: Lovable)
+    CORS(app)
 
 
 @app.route("/")
 def home():
     return send_file("index.html")
+
+
+@app.route("/historico")
+def historico():
+    return send_file("historico.html")
 
 
 @app.route("/api/noticias")
@@ -382,32 +429,22 @@ def api_noticias():
     return jsonify({"atualizado": int(agora), "total": len(saida), "itens": saida})
 
 
-@app.route("/api/aprendizado")
-def api_aprendizado():
-    """Transparencia: o que a equipe ensinou ate agora."""
-    itens = sorted(_AJUSTES.items(), key=lambda x: x[1], reverse=True)
-    fmt = [{"caracteristica": f, "ajuste": round(a, 1)} for f, a in itens]
-    return jsonify({"pesos": fmt})
-
-
-@app.route("/historico")
-def historico():
-    return send_file("historico.html")
-
-
 @app.route("/api/historico")
 def api_historico():
-    con = _db()
-    rows = con.execute("""SELECT chave, titulo, beat, score, ts, link,
-                                 decisao, decidido_por, decidido_em
-                          FROM noticias_enviadas ORDER BY ts DESC LIMIT 300""").fetchall()
-    out = []
-    for chave, titulo, beat, score, ts, link, decisao, por, em in rows:
-        out.append({"chave": chave, "titulo": titulo, "beat": beat, "score": score,
-                    "ts": ts, "link": link or "", "status": decisao or "pendente",
-                    "decidido_por": por or "", "decidido_em": em or 0})
-    con.close()
+    rows = db_all("""SELECT chave, titulo, beat, score, ts, link, decisao, decidido_por, decidido_em
+                     FROM noticias_enviadas ORDER BY ts DESC LIMIT 300""")
+    out = [{
+        "chave": r[0], "titulo": r[1], "beat": r[2], "score": r[3], "ts": r[4],
+        "link": r[5] or "", "status": r[6] or "pendente",
+        "decidido_por": r[7] or "", "decidido_em": r[8] or 0,
+    } for r in rows]
     return jsonify({"total": len(out), "itens": out})
+
+
+@app.route("/api/aprendizado")
+def api_aprendizado():
+    itens = sorted(_AJUSTES.items(), key=lambda x: x[1], reverse=True)
+    return jsonify({"pesos": [{"caracteristica": f, "ajuste": round(a, 1)} for f, a in itens]})
 
 
 @app.route("/api/voto", methods=["POST"])
@@ -482,19 +519,14 @@ def _loop():
         time.sleep(INTERVALO_MIN * 60)
 
 
-def _migrate():
-    con = _db()
-    for coluna in ("link TEXT", "decisao TEXT", "decidido_por TEXT", "decidido_em INTEGER"):
-        try:
-            con.execute("ALTER TABLE noticias_enviadas ADD COLUMN " + coluna)
-            con.commit()
-        except Exception:
-            pass
-    con.close()
-
-
 def _start_bg():
-    _migrate()
+    if not DATABASE_URL:
+        print("[ERRO] DATABASE_URL nao definida. Configure o Postgres (Neon) para persistir os dados.")
+        return
+    try:
+        init_db()
+    except Exception as e:
+        print(f"[aviso] init_db: {e}")
     _load_ajustes()
     if os.environ.get("PALPYT_NO_BG") != "1":
         threading.Thread(target=_loop, daemon=True).start()
