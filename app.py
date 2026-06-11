@@ -37,8 +37,9 @@ except Exception:
 #  CONFIGURACAO  (mexa so aqui)
 # ============================================================
 TELEGRAM_TOKEN   = os.environ.get("PALPYT_TG_TOKEN", "")   # token do @BotFather
-TELEGRAM_CHAT_ID = os.environ.get("PALPYT_TG_CHAT",  "")   # id do GRUPO (negativo)
+TELEGRAM_CHAT_ID = os.environ.get("PALPYT_TG_CHAT",  "")   # id do GRUPO de curadoria (negativo)
 TELEGRAM_SECRET  = os.environ.get("PALPYT_TG_SECRET", "")  # opcional, protege o webhook
+TELEGRAM_POSTAGEM_CHAT = os.environ.get("PALPYT_TG_POSTAGEM", "")  # grupo que recebe os aprovados
 
 INTERVALO_MIN  = 5     # varredura automatica de fundo (minutos)
 CACHE_MIN      = 4     # nao re-minera mais rapido que isso ao receber visitas
@@ -62,6 +63,8 @@ BEATS = [
      "q": "Virginia OR Anitta OR famosos OR affair OR polêmica OR término OR Neymar when:2h"},
     {"nome": "Brasil Geral", "prioridade": 7,
      "q": "site:g1.globo.com OR site:cnnbrasil.com.br when:1h"},
+    {"nome": "Leo Dias", "prioridade": 10, "janela": 48,
+     "q": "site:portalleodias.com when:24h"},
 ]
 
 PALAVRAS_QUENTES = {
@@ -77,10 +80,11 @@ PALAVRAS_QUENTES = {
 }
 VOCAB = set(PALAVRAS_QUENTES.keys())
 
-FEEDS_DIRETOS = {
-    "InfoMoney":  "https://www.infomoney.com.br/feed/",
-    "CNN Brasil": "https://www.cnnbrasil.com.br/feed/",
-}
+FEEDS_DIRETOS = [
+    {"nome": "InfoMoney",  "url": "https://www.infomoney.com.br/feed/"},
+    {"nome": "CNN Brasil", "url": "https://www.cnnbrasil.com.br/feed/"},
+    {"nome": "Leo Dias",   "url": "https://portalleodias.com/feed/", "prioridade": 10, "janela": 48},
+]
 
 DB_PATH = os.environ.get("PALPYT_DB", "palpyt_radar.db")
 
@@ -97,7 +101,8 @@ def _db():
     con.execute("CREATE TABLE IF NOT EXISTS vistos (id TEXT PRIMARY KEY, ts INTEGER)")
     con.execute("""CREATE TABLE IF NOT EXISTS noticias_enviadas
                    (chave TEXT PRIMARY KEY, titulo TEXT, beat TEXT,
-                    keywords TEXT, score INTEGER, ts INTEGER, link TEXT)""")
+                    keywords TEXT, score INTEGER, ts INTEGER, link TEXT,
+                    decisao TEXT, decidido_por TEXT, decidido_em INTEGER)""")
     con.execute("""CREATE TABLE IF NOT EXISTS votos
                    (chave TEXT, user_id INTEGER, voto INTEGER, nome TEXT, ts INTEGER,
                     PRIMARY KEY (chave, user_id))""")
@@ -167,13 +172,13 @@ def _calor_base(titulo, minutos, prioridade):
 
 
 def _coletar():
-    fontes = [(b["nome"], b["prioridade"], gnews_url(b["q"])) for b in BEATS]
-    for nome, url in FEEDS_DIRETOS.items():
-        fontes.append((nome, 8, url))
+    fontes = [(b["nome"], b["prioridade"], gnews_url(b["q"]), b.get("janela", JANELA_HORAS)) for b in BEATS]
+    for f in FEEDS_DIRETOS:
+        fontes.append((f["nome"], f.get("prioridade", 8), f["url"], f.get("janela", JANELA_HORAS)))
 
     achadas = {}
     agora = time.time()
-    for nome, prioridade, url in fontes:
+    for nome, prioridade, url, janela in fontes:
         try:
             feed = feedparser.parse(url)
         except Exception as e:
@@ -186,7 +191,7 @@ def _coletar():
                 continue
             ep = _epoch(entry)
             mins = (agora - ep) / 60.0 if ep else None
-            if mins is not None and mins > JANELA_HORAS * 60:
+            if mins is not None and mins > janela * 60:
                 continue
             feats = _features(titulo, nome)
             base = _calor_base(titulo, mins, prioridade)
@@ -201,7 +206,7 @@ def _coletar():
                 "beat": nome, "epoch": ep or int(agora), "score": score,
                 "chave": chave, "feats": feats,
             }
-    return sorted(achadas.values(), key=lambda x: x["score"], reverse=True)[:45]
+    return sorted(achadas.values(), key=lambda x: x["score"], reverse=True)[:80]
 
 
 # ============================================================
@@ -249,12 +254,40 @@ def _enviar_telegram(itens):
         })
 
 
-def _contagem(chave):
+def _encaminhar_postagem(n, quem):
+    """Encaminha a noticia aprovada para o grupo da equipe de postagem."""
+    if not (TELEGRAM_TOKEN and TELEGRAM_POSTAGEM_CHAT):
+        return
+    texto = (f"✅ APROVADA para postagem\n\n{n['titulo']}\n\n"
+             f"{n['beat']} · relevância {n['score']}\n{n.get('link') or ''}\n\n"
+             f"(aprovada por {quem})")
+    _tg("sendMessage", {"chat_id": TELEGRAM_POSTAGEM_CHAT, "text": texto,
+                        "disable_web_page_preview": False})
+
+
+def _registrar_decisao(chave, aprovar, quem):
+    """O PRIMEIRO voto decide e trava. Votos posteriores sao ignorados."""
     con = _db()
-    ap = con.execute("SELECT COUNT(*) FROM votos WHERE chave=? AND voto>0", (chave,)).fetchone()[0]
-    rj = con.execute("SELECT COUNT(*) FROM votos WHERE chave=? AND voto<0", (chave,)).fetchone()[0]
+    row = con.execute("""SELECT decisao, decidido_por, titulo, beat, link, score
+                         FROM noticias_enviadas WHERE chave=?""", (chave,)).fetchone()
+    if not row:
+        con.close()
+        return {"status": "desconhecida", "ja_decidida": False, "novo": False}
+    decisao, por, titulo, beat, link, score = row
+    if decisao:  # ja decidida -> ignora o novo voto
+        con.close()
+        return {"status": decisao, "decidido_por": por, "ja_decidida": True, "novo": False}
+    nova = "aprovada" if aprovar else "rejeitada"
+    con.execute("UPDATE noticias_enviadas SET decisao=?, decidido_por=?, decidido_em=? WHERE chave=?",
+                (nova, quem, int(time.time()), chave))
+    con.execute("INSERT OR REPLACE INTO votos VALUES (?,?,?,?,?)",
+                (chave, quem, 1 if aprovar else -1, quem, int(time.time())))
+    con.commit()
     con.close()
-    return ap, rj
+    _recompute_aprendizado()
+    if nova == "aprovada":
+        _encaminhar_postagem({"titulo": titulo, "beat": beat, "link": link, "score": score}, quem)
+    return {"status": nova, "decidido_por": quem, "ja_decidida": False, "novo": True}
 
 
 # ============================================================
@@ -269,18 +302,19 @@ def _load_ajustes():
 
 
 def _recompute_aprendizado():
-    """Recalcula os pesos do zero a partir de todos os votos (idempotente)."""
+    """Recalcula os pesos: cada noticia DECIDIDA conta uma unica vez."""
     con = _db()
-    rows = con.execute("""SELECT n.keywords, v.voto FROM votos v
-                          JOIN noticias_enviadas n ON n.chave = v.chave""").fetchall()
+    rows = con.execute("""SELECT keywords, decisao FROM noticias_enviadas
+                          WHERE decisao IS NOT NULL""").fetchall()
     tally = {}
-    for kw_json, voto in rows:
+    for kw_json, decisao in rows:
         try:
-            feats = json.loads(kw_json)
+            feats = json.loads(kw_json) if kw_json else []
         except Exception:
             feats = []
+        s = 1 if decisao == "aprovada" else -1
         for f in feats:
-            tally[f] = tally.get(f, 0) + (1 if voto > 0 else -1)
+            tally[f] = tally.get(f, 0) + s
     con.execute("DELETE FROM aprendizado")
     for f, saldo in tally.items():
         aj = max(-APRENDIZADO_MAX, min(APRENDIZADO_MAX, APRENDIZADO_PASSO * saldo))
@@ -358,22 +392,14 @@ def historico():
 @app.route("/api/historico")
 def api_historico():
     con = _db()
-    rows = con.execute("""SELECT chave, titulo, beat, score, ts, link
+    rows = con.execute("""SELECT chave, titulo, beat, score, ts, link,
+                                 decisao, decidido_por, decidido_em
                           FROM noticias_enviadas ORDER BY ts DESC LIMIT 300""").fetchall()
     out = []
-    for chave, titulo, beat, score, ts, link in rows:
-        ap = con.execute("SELECT COUNT(*) FROM votos WHERE chave=? AND voto>0", (chave,)).fetchone()[0]
-        rj = con.execute("SELECT COUNT(*) FROM votos WHERE chave=? AND voto<0", (chave,)).fetchone()[0]
-        if ap > rj:
-            status = "aprovada"
-        elif rj > ap:
-            status = "rejeitada"
-        elif ap == 0 and rj == 0:
-            status = "sem_votos"
-        else:
-            status = "empate"
+    for chave, titulo, beat, score, ts, link, decisao, por, em in rows:
         out.append({"chave": chave, "titulo": titulo, "beat": beat, "score": score,
-                    "ts": ts, "link": link or "", "ap": ap, "rj": rj, "status": status})
+                    "ts": ts, "link": link or "", "status": decisao or "pendente",
+                    "decidido_por": por or "", "decidido_em": em or 0})
     con.close()
     return jsonify({"total": len(out), "itens": out})
 
@@ -385,16 +411,10 @@ def api_voto():
     if not chave:
         return jsonify({"erro": "campo 'chave' é obrigatório"}), 400
     aprovar = str(body.get("voto", "")).lower() in ("1", "ap", "aprovar", "aprovado", "sim", "true")
-    voto = 1 if aprovar else -1
     usuario = str(body.get("usuario") or "web")
-    con = _db()
-    con.execute("INSERT OR REPLACE INTO votos VALUES (?,?,?,?,?)",
-                (chave, usuario, voto, usuario, int(time.time())))
-    con.commit()
-    con.close()
-    _recompute_aprendizado()
-    ap, rj = _contagem(chave)
-    return jsonify({"ok": True, "chave": chave, "ap": ap, "rj": rj})
+    res = _registrar_decisao(chave, aprovar, usuario)
+    return jsonify({"ok": True, "chave": chave, "status": res["status"],
+                    "decidido_por": res.get("decidido_por", ""), "ja_decidida": res["ja_decidida"]})
 
 
 @app.route("/telegram/setup")
@@ -423,19 +443,24 @@ def tg_webhook():
         frm = cq.get("from", {}) or {}
         if "|" in data:
             acao, chave = data.split("|", 1)
-            voto = 1 if acao == "ap" else -1
-            con = _db()
-            con.execute("INSERT OR REPLACE INTO votos VALUES (?,?,?,?,?)",
-                        (chave, frm.get("id"), voto, frm.get("first_name", ""), int(time.time())))
-            con.commit()
-            con.close()
-            _recompute_aprendizado()
-            ap, rj = _contagem(chave)
-            if chat_id and msg_id:
-                _tg("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": msg_id,
-                                               "reply_markup": _teclado(chave, ap, rj)})
-            _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
-                                        "text": "Voto registrado. Obrigado!"})
+            quem = frm.get("first_name") or str(frm.get("id"))
+            res = _registrar_decisao(chave, acao == "ap", quem)
+            if res["ja_decidida"]:
+                _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
+                    "text": f"Já foi {res['status']} por {res.get('decidido_por','alguém')}. Voto ignorado."})
+            elif res["novo"]:
+                rotulo = "✅ APROVADA" if res["status"] == "aprovada" else "❌ REJEITADA"
+                extra = " — encaminhada para postagem" if res["status"] == "aprovada" else ""
+                if chat_id and msg_id:
+                    novo_texto = (msg.get("text", "") + f"\n\n— {rotulo} por {quem}{extra}")
+                    _tg("editMessageText", {"chat_id": chat_id, "message_id": msg_id,
+                                            "text": novo_texto, "reply_markup": {"inline_keyboard": []},
+                                            "disable_web_page_preview": True})
+                _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
+                                            "text": "Decisão registrada. Obrigado!"})
+            else:
+                _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
+                                            "text": "Notícia não encontrada."})
     return jsonify({"ok": True})
 
 
@@ -453,11 +478,12 @@ def _loop():
 
 def _migrate():
     con = _db()
-    try:
-        con.execute("ALTER TABLE noticias_enviadas ADD COLUMN link TEXT")
-        con.commit()
-    except Exception:
-        pass
+    for coluna in ("link TEXT", "decisao TEXT", "decidido_por TEXT", "decidido_em INTEGER"):
+        try:
+            con.execute("ALTER TABLE noticias_enviadas ADD COLUMN " + coluna)
+            con.commit()
+        except Exception:
+            pass
     con.close()
 
 

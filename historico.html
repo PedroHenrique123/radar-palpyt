@@ -22,7 +22,7 @@
   .stats{display:flex; gap:22px; flex-wrap:wrap; padding:16px 2px 4px; font-size:14px;}
   .stats b{font-size:20px; font-weight:700; display:block; color:#111;}
   .stats .lbl{color:#888; font-size:12.5px;}
-  .stats .ap b{color:#1f8a4c;} .stats .rj b{color:#b1361f;}
+  .stats .ap b{color:#1f8a4c;} .stats .rj b{color:#b1361f;} .stats .pe b{color:#a06010;}
 
   .secao{font-size:12.5px; color:#999; text-transform:uppercase; letter-spacing:.5px;
     margin:22px 2px 8px; border-bottom:1px solid #ececec; padding-bottom:6px;}
@@ -42,19 +42,16 @@
   ul{list-style:none; margin:0; padding:0;}
   li{display:flex; gap:14px; align-items:flex-start; padding:13px 2px; border-bottom:1px solid #ececec;}
   li:hover{background:#f5f5f5;}
-  .votos{flex:0 0 84px; font-size:13px; color:#666; font-variant-numeric:tabular-nums;}
-  .votos .a{color:#1f8a4c;} .votos .r{color:#b1361f;}
   .corpo{flex:1; min-width:0;}
   .corpo a.tit, .corpo .tit{color:#1a1a1a; text-decoration:none; font-weight:600; font-size:15px;}
   .corpo a.tit:hover{text-decoration:underline;}
   .meta{font-size:12.5px; color:#888; margin-top:3px;}
   .cat-tag{display:inline-flex; align-items:center;}
-  .st{flex:0 0 92px; text-align:right; font-size:12px;}
+  .st{flex:0 0 100px; text-align:right;}
   .badge{display:inline-block; padding:2px 8px; border-radius:4px; font-size:11.5px; font-weight:600;}
   .badge.aprovada{background:#e7f3ea; color:#1f6b3c;}
   .badge.rejeitada{background:#f7e7e4; color:#9a2f1c;}
-  .badge.empate{background:#f6efdc; color:#8a6512;}
-  .badge.sem_votos{background:#eee; color:#888;}
+  .badge.pendente{background:#f6efdc; color:#8a6512;}
 
   .estado{padding:26px 2px; color:#888; font-size:14px;}
   footer{margin-top:24px; font-size:12px; color:#999;}
@@ -84,17 +81,17 @@
   <ul id="lista"></ul>
   <div class="estado" id="estado">Carregando…</div>
 
-  <footer>Histórico das notícias enviadas ao grupo e os votos da equipe.</footer>
+  <footer>Histórico das notícias enviadas. A decisão é definida pelo primeiro voto e fica travada; quando aprovada, é encaminhada para a equipe de postagem.</footer>
 </div>
 
 <script>
   var CORES = {
     "Mercado/Economia":"#1f8a4c","Política BR":"#a06010","Mundo/Guerra":"#b1361f",
-    "Futebol":"#1d4ed8","Celebridades/Fofoca":"#7b3aa0","Brasil Geral":"#555"
+    "Futebol":"#1d4ed8","Celebridades/Fofoca":"#7b3aa0","Leo Dias":"#be185d","Brasil Geral":"#555"
   };
-  var FCAT = ["Todas","Mercado/Economia","Política BR","Mundo/Guerra","Futebol","Celebridades/Fofoca"];
-  var FSTATUS = [["Todas","todas"],["Aprovadas","aprovada"],["Rejeitadas","rejeitada"],["Sem votos","sem_votos"]];
-  var STLABEL = {aprovada:"Aprovada",rejeitada:"Rejeitada",empate:"Empate",sem_votos:"Sem votos"};
+  var FCAT = ["Todas","Leo Dias","Mercado/Economia","Política BR","Mundo/Guerra","Futebol","Celebridades/Fofoca"];
+  var FSTATUS = [["Todas","todas"],["Pendentes","pendente"],["Aprovadas","aprovada"],["Rejeitadas","rejeitada"]];
+  var STLABEL = {aprovada:"Aprovada",rejeitada:"Rejeitada",pendente:"Pendente"};
   var dados = [], fcat="Todas", fstatus="todas";
 
   function esc(s){ return (s||"").replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
@@ -105,12 +102,12 @@
   function renderStats(){
     var ap=dados.filter(function(n){return n.status==="aprovada";}).length;
     var rj=dados.filter(function(n){return n.status==="rejeitada";}).length;
-    var sv=dados.filter(function(n){return n.status==="sem_votos";}).length;
+    var pe=dados.filter(function(n){return n.status==="pendente";}).length;
     document.getElementById("stats").innerHTML =
       '<div><b>'+dados.length+'</b><span class="lbl">enviadas</span></div>'
+      +'<div class="pe"><b>'+pe+'</b><span class="lbl">pendentes</span></div>'
       +'<div class="ap"><b>'+ap+'</b><span class="lbl">aprovadas</span></div>'
-      +'<div class="rj"><b>'+rj+'</b><span class="lbl">rejeitadas</span></div>'
-      +'<div><b>'+sv+'</b><span class="lbl">sem votos</span></div>';
+      +'<div class="rj"><b>'+rj+'</b><span class="lbl">rejeitadas</span></div>';
   }
 
   function renderCategorias(){
@@ -152,12 +149,12 @@
       var titulo = n.link
         ? '<a class="tit" href="'+esc(n.link)+'" target="_blank" rel="noopener">'+esc(n.titulo)+'</a>'
         : '<span class="tit">'+esc(n.titulo)+'</span>';
+      var quem = (n.status!=="pendente" && n.decidido_por) ? ' &nbsp;·&nbsp; por '+esc(n.decidido_por) : '';
       return '<li>'
-        + '<div class="votos"><span class="a">✓ '+n.ap+'</span> &nbsp; <span class="r">✗ '+n.rj+'</span></div>'
         + '<div class="corpo">'+titulo
         +   '<div class="meta"><span class="cat-tag"><span class="dot" style="background:'+cor+'"></span>'+esc(n.beat)+'</span>'
-        +   ' &nbsp;·&nbsp; relevância '+n.score+' &nbsp;·&nbsp; '+data(n.ts)+'</div></div>'
-        + '<div class="st"><span class="badge '+n.status+'">'+STLABEL[n.status]+'</span></div>'
+        +   ' &nbsp;·&nbsp; relevância '+n.score+' &nbsp;·&nbsp; '+data(n.ts)+quem+'</div></div>'
+        + '<div class="st"><span class="badge '+n.status+'">'+(STLABEL[n.status]||n.status)+'</span></div>'
         + '</li>';
     }).join("");
   }
