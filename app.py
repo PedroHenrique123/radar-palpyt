@@ -293,21 +293,14 @@ def _teclado(chave):
     ]]}
 
 
-def _enviar_telegram(itens):
+def _postar_telegram(n):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
-    for n in itens:
-        db_exec("""INSERT INTO noticias_enviadas (chave,titulo,beat,keywords,score,ts,link)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (chave) DO UPDATE SET titulo=EXCLUDED.titulo, beat=EXCLUDED.beat,
-                     keywords=EXCLUDED.keywords, score=EXCLUDED.score, ts=EXCLUDED.ts, link=EXCLUDED.link""",
-                (n["chave"], n["titulo"], n["beat"], json.dumps(n["feats"]),
-                 n["score"], int(time.time()), n.get("link", "")))
-        texto = (f"{n['beat']}  (relevância {n['score']})\n\n"
-                 f"{n['titulo']}\n\n{n['fonte']}\n{n['link']}")
-        _tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": texto,
-                            "reply_markup": _teclado(n["chave"]),
-                            "disable_web_page_preview": False})
+    texto = (f"{n['beat']}  (relevância {n['score']})\n\n"
+             f"{n['titulo']}\n\n{n['fonte']}\n{n['link']}")
+    _tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": texto,
+                        "reply_markup": _teclado(n["chave"]),
+                        "disable_web_page_preview": False})
 
 
 def _encaminhar_postagem(n, quem):
@@ -392,27 +385,35 @@ def minerar(force=False):
         if not force and (time.time() - _cache["ts"]) < CACHE_MIN * 60 and _cache["items"]:
             return _cache["items"]
         itens = _coletar()
-        novos = []
+        para_tg = []
         agora = int(time.time())
         con = _conn()
         try:
             cur = con.cursor()
             for n in itens:
-                if n["score"] < SCORE_TELEGRAM:
+                # entra na fila de aprovacao se for quente OU de uma fonte dedicada
+                if n["score"] < SCORE_TELEGRAM and n["beat"] not in SEMPRE_BEATS:
                     continue
                 cur.execute("SELECT 1 FROM vistos WHERE id=%s", (n["chave"],))
                 if cur.fetchone():
                     continue
                 cur.execute("INSERT INTO vistos (id, ts) VALUES (%s,%s) ON CONFLICT (id) DO NOTHING",
                             (n["chave"], agora))
-                novos.append(n)
+                cur.execute("""INSERT INTO noticias_enviadas (chave,titulo,beat,keywords,score,ts,link)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s)
+                               ON CONFLICT (chave) DO UPDATE SET titulo=EXCLUDED.titulo, beat=EXCLUDED.beat,
+                                 keywords=EXCLUDED.keywords, score=EXCLUDED.score, ts=EXCLUDED.ts, link=EXCLUDED.link""",
+                            (n["chave"], n["titulo"], n["beat"], json.dumps(n["feats"]),
+                             n["score"], agora, n.get("link", "")))
+                if n["score"] >= SCORE_TELEGRAM:
+                    para_tg.append(n)
             cur.execute("DELETE FROM vistos WHERE ts < %s", (agora - 4 * 86400,))
         finally:
             con.close()
         _cache["items"] = itens
         _cache["ts"] = time.time()
-    if novos:
-        _enviar_telegram(novos)
+    for n in para_tg:
+        _postar_telegram(n)
     return itens
 
 
