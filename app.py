@@ -99,6 +99,11 @@ if _choquei_feed:
 # Fontes dedicadas: nunca cortadas por tempo nem por limite (voce quer ver tudo delas).
 SEMPRE_BEATS = {"Leo Dias", "Choquei"}
 
+# Lista FIXA de categorias para os menus (nao depende dos dados do momento).
+CATEGORIAS = ["Leo Dias", "Choquei", "Mercado/Economia", "Política BR",
+              "Mundo/Guerra", "Futebol", "Celebridades/Fofoca", "Brasil Geral",
+              "InfoMoney", "CNN Brasil"]
+
 # ============================================================
 #  BANCO (PostgreSQL)
 # ============================================================
@@ -462,7 +467,17 @@ def api_aprendizado():
 @app.route("/api/fontes")
 def api_fontes():
     """Diagnostico: fontes configuradas e quantos itens cada uma trouxe na ultima varredura."""
+    try:
+        minerar()
+    except Exception:
+        pass
     return jsonify(_DIAG)
+
+
+@app.route("/api/categorias")
+def api_categorias():
+    """Lista FIXA de categorias para os menus (nao some quando faltam dados num ciclo)."""
+    return jsonify({"categorias": CATEGORIAS})
 
 
 @app.route("/api/voto", methods=["POST"])
