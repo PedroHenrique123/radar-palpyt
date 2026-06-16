@@ -24,6 +24,7 @@ import re
 import json
 import calendar
 import threading
+import unicodedata
 from urllib.parse import quote_plus
 
 import feedparser
@@ -50,7 +51,8 @@ TELEGRAM_POSTAGEM_CHAT = os.environ.get("PALPYT_TG_POSTAGEM", "")  # grupo dos a
 INTERVALO_MIN  = 5     # varredura automatica de fundo (minutos)
 CACHE_MIN      = 4     # nao re-minera mais rapido que isso ao receber visitas
 JANELA_HORAS   = 3     # idade maxima padrao das noticias
-SCORE_TELEGRAM = 60    # so manda no grupo acima dessa relevancia
+SCORE_MINIMO   = 75    # so entra na fila/Telegram noticia quente acima disso
+CONFIABILIDADE_BONUS = 12  # bonus de relevancia para fontes confiaveis
 
 APRENDIZADO_PASSO = 3   # quanto cada decisao move o peso de uma caracteristica
 APRENDIZADO_MAX   = 30  # limite do ajuste aprendido
@@ -84,6 +86,16 @@ PALAVRAS_QUENTES = {
     "despenca": 14, "surpresa": 10, "inédito": 10, "liberado": 8, "vence": 8,
 }
 VOCAB = set(PALAVRAS_QUENTES.keys())
+
+# Fontes jornalisticas confiaveis (substrings, sem acento, minusculas).
+# Noticias do fluxo principal so entram se vierem de uma destas.
+FONTES_CONFIAVEIS = {
+    "g1", "globo", "infomoney", "cnn", "folha", "estadao", "uol",
+    "valor", "metropoles", "veja", "exame", "poder360", "agencia brasil",
+    "bbc", "reuters", "bloomberg", "espn", "r7", "terra", "gazeta do povo",
+    "jovem pan", "istoe", "correio braziliense", "o tempo", "band",
+    "the guardian", "new york times", "el pais", "deutsche welle", "cnbc",
+}
 
 FEEDS_DIRETOS = [
     {"nome": "InfoMoney",  "url": "https://www.infomoney.com.br/feed/"},
@@ -197,6 +209,16 @@ def _fonte(entry, fallback):
     return fallback
 
 
+def _sem_acento(s):
+    return "".join(c for c in unicodedata.normalize("NFD", s or "")
+                   if unicodedata.category(c) != "Mn")
+
+
+def _confiavel(fonte):
+    f = _sem_acento((fonte or "").lower())
+    return any(t in f for t in FONTES_CONFIAVEIS)
+
+
 def _features(titulo, beat):
     t = titulo.lower()
     feats = ["beat:" + beat]
@@ -248,17 +270,20 @@ def _coletar():
             if nome not in SEMPRE_BEATS and mins is not None and mins > janela * 60:
                 continue
             feats = _features(titulo, nome)
+            fonte = _fonte(entry, nome)
+            confiavel = _confiavel(fonte)
             base = _calor_base(titulo, mins, prioridade)
             aprendido = sum(_AJUSTES.get(f, 0) for f in feats)
-            score = max(0, min(100, int(base + aprendido)))
+            bonus = CONFIABILIDADE_BONUS if confiavel else 0
+            score = max(0, min(100, int(base + aprendido + bonus)))
             chave = _chave(titulo)
             atual = achadas.get(chave)
             if atual and atual["score"] >= score:
                 continue
             achadas[chave] = {
-                "titulo": titulo, "link": link, "fonte": _fonte(entry, nome),
+                "titulo": titulo, "link": link, "fonte": fonte,
                 "beat": nome, "epoch": ep or int(agora), "score": score,
-                "chave": chave, "feats": feats,
+                "chave": chave, "feats": feats, "confiavel": confiavel,
             }
     itens = sorted(achadas.values(), key=lambda x: x["score"], reverse=True)
     cont = {}
@@ -266,9 +291,10 @@ def _coletar():
         cont[n["beat"]] = cont.get(n["beat"], 0) + 1
     _DIAG["fontes"] = [b["nome"] for b in BEATS] + [f["nome"] for f in FEEDS_DIRETOS]
     _DIAG["contagem"] = cont
-    sempre = [n for n in itens if n["beat"] in SEMPRE_BEATS]
-    resto = [n for n in itens if n["beat"] not in SEMPRE_BEATS][:80]
-    return sorted(sempre + resto, key=lambda x: x["score"], reverse=True)
+    dedicadas = [n for n in itens if n["beat"] in SEMPRE_BEATS]
+    principais = [n for n in itens
+                  if n["beat"] not in SEMPRE_BEATS and n["score"] >= SCORE_MINIMO and n["confiavel"]][:80]
+    return sorted(dedicadas + principais, key=lambda x: x["score"], reverse=True)
 
 
 # ============================================================
@@ -391,9 +417,7 @@ def minerar(force=False):
         try:
             cur = con.cursor()
             for n in itens:
-                # entra na fila de aprovacao se for quente OU de uma fonte dedicada
-                if n["score"] < SCORE_TELEGRAM and n["beat"] not in SEMPRE_BEATS:
-                    continue
+                # itens ja vem filtrado: principais (75+ confiaveis) + fontes dedicadas
                 cur.execute("SELECT 1 FROM vistos WHERE id=%s", (n["chave"],))
                 if cur.fetchone():
                     continue
@@ -405,7 +429,7 @@ def minerar(force=False):
                                  keywords=EXCLUDED.keywords, score=EXCLUDED.score, ts=EXCLUDED.ts, link=EXCLUDED.link""",
                             (n["chave"], n["titulo"], n["beat"], json.dumps(n["feats"]),
                              n["score"], agora, n.get("link", "")))
-                if n["score"] >= SCORE_TELEGRAM:
+                if n["beat"] not in SEMPRE_BEATS:
                     para_tg.append(n)
             cur.execute("DELETE FROM vistos WHERE ts < %s", (agora - 4 * 86400,))
         finally:
