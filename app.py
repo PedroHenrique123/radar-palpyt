@@ -48,7 +48,7 @@ TELEGRAM_CHAT_ID = os.environ.get("PALPYT_TG_CHAT",  "")   # id do GRUPO de cura
 TELEGRAM_SECRET  = os.environ.get("PALPYT_TG_SECRET", "")  # opcional, protege o webhook
 TELEGRAM_POSTAGEM_CHAT = os.environ.get("PALPYT_TG_POSTAGEM", "")  # grupo dos aprovados
 
-INTERVALO_MIN  = 5     # varredura automatica de fundo (minutos)
+INTERVALO_MIN  = 15    # varredura automatica de fundo (minutos) - espacado p/ poupar o banco
 CACHE_MIN      = 4     # nao re-minera mais rapido que isso ao receber visitas
 JANELA_HORAS   = 3     # idade maxima padrao das noticias
 SCORE_MINIMO   = 75    # so entra na fila/Telegram noticia quente acima disso
