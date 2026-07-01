@@ -48,6 +48,17 @@
 
   .estado{padding:26px 2px; color:#888; font-size:14px;}
   footer{margin-top:24px; font-size:12px; color:#999;}
+
+  .destaques{border:1px solid #e2e2e2; border-radius:6px; padding:12px 14px; margin:14px 0 2px; background:#fff;}
+  .destaques h2{font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#b1361f; margin:0 0 8px; font-weight:700;}
+  .destaques ol{list-style:none; margin:0; padding:0;}
+  .destaques li{display:flex; gap:10px; align-items:baseline; padding:5px 0; border:0;}
+  .destaques li:hover{background:transparent;}
+  .destaques .rk{flex:0 0 14px; color:#b1361f; font-weight:700; font-size:13px;}
+  .destaques .dscore{flex:0 0 28px; font-size:12px; color:#666; font-weight:600;}
+  .destaques a{color:#1a1a1a; text-decoration:none; font-weight:600; font-size:14px;}
+  .destaques a:hover{text-decoration:underline;}
+  .destaques .db{font-size:12px; color:#999;}
 </style>
 </head>
 <body>
@@ -61,6 +72,11 @@
       <button id="btn" onclick="carregar(true)">Atualizar</button>
     </div>
   </header>
+
+  <div class="destaques" id="destaques" style="display:none">
+    <h2>Destaques · últimas 3h</h2>
+    <ol id="destaques-lista"></ol>
+  </div>
 
   <div class="filtros" id="filtros"></div>
 
@@ -148,9 +164,29 @@
       .then(function(){ btn.disabled = false; btn.textContent = "Atualizar"; });
   }
 
+  function carregarDestaques(){
+    fetch("/api/destaques").then(function(r){ return r.json(); }).then(function(d){
+      var itens = d.itens || [];
+      var box = document.getElementById("destaques");
+      if(!itens.length){ box.style.display = "none"; return; }
+      document.getElementById("destaques-lista").innerHTML = itens.map(function(n,i){
+        return '<li>'
+          + '<span class="rk">'+(i+1)+'</span>'
+          + '<span class="dscore">'+n.score+'</span>'
+          + '<span style="flex:1;min-width:0">'
+          +   '<a href="'+esc(n.link)+'" target="_blank" rel="noopener">'+esc(n.titulo)+'</a>'
+          +   ' <span class="db">· '+esc(n.beat)+'</span>'
+          + '</span>'
+          + '</li>';
+      }).join("");
+      box.style.display = "block";
+    }).catch(function(){});
+  }
+
   renderFiltros();
   carregar(false);
-  setInterval(function(){ carregar(false); }, 180000); // atualiza sozinho a cada 3 min
+  carregarDestaques();
+  setInterval(function(){ carregar(false); carregarDestaques(); }, 180000); // atualiza sozinho a cada 3 min
 </script>
 </body>
 </html>

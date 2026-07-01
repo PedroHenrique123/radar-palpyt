@@ -43,16 +43,23 @@ except Exception:
 # ============================================================
 DATABASE_URL = os.environ.get("DATABASE_URL", "")          # Postgres (Neon)
 
-TELEGRAM_TOKEN   = os.environ.get("PALPYT_TG_TOKEN", "")   # token do @BotFather
+TELEGRAM_TOKEN   = os.environ.get("PALPYT_TG_TOKEN", "")   # token do @BotFather (fluxo continuo)
 TELEGRAM_CHAT_ID = os.environ.get("PALPYT_TG_CHAT",  "")   # id do GRUPO de curadoria
 TELEGRAM_SECRET  = os.environ.get("PALPYT_TG_SECRET", "")  # opcional, protege o webhook
 TELEGRAM_POSTAGEM_CHAT = os.environ.get("PALPYT_TG_POSTAGEM", "")  # grupo dos aprovados
 
-INTERVALO_MIN  = 15    # varredura automatica de fundo (minutos) - espacado p/ poupar o banco
+# 2o bot, dedicado ao resumo "Top 5 a cada 3h" (separado do fluxo continuo)
+TELEGRAM_TOKEN2  = os.environ.get("PALPYT_TG_TOKEN2", "")
+TELEGRAM_CHAT2   = os.environ.get("PALPYT_TG_CHAT2", "")
+TELEGRAM_SECRET2 = os.environ.get("PALPYT_TG_SECRET2", "")
+
+INTERVALO_MIN  = 10    # varredura automatica de fundo (minutos)
 CACHE_MIN      = 4     # nao re-minera mais rapido que isso ao receber visitas
 JANELA_HORAS   = 3     # idade maxima padrao das noticias
 SCORE_MINIMO   = 75    # so entra na fila/Telegram noticia quente acima disso
 CONFIABILIDADE_BONUS = 12  # bonus de relevancia para fontes confiaveis
+RESUMO_HORAS   = 3     # a cada quantas horas mandar o Top N
+RESUMO_TOP_N   = 5     # quantas noticias no resumo
 
 APRENDIZADO_PASSO = 3   # quanto cada decisao move o peso de uma caracteristica
 APRENDIZADO_MAX   = 30  # limite do ajuste aprendido
@@ -173,8 +180,22 @@ def init_db():
                         PRIMARY KEY (chave, user_id))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS aprendizado
                        (feature TEXT PRIMARY KEY, ajuste DOUBLE PRECISION, saldo INTEGER)""")
+        cur.execute("CREATE TABLE IF NOT EXISTS config (chave TEXT PRIMARY KEY, valor TEXT)")
     finally:
         con.close()
+
+
+def _get_config(chave):
+    try:
+        row = db_one("SELECT valor FROM config WHERE chave=%s", (chave,))
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _set_config(chave, valor):
+    db_exec("""INSERT INTO config (chave, valor) VALUES (%s,%s)
+               ON CONFLICT (chave) DO UPDATE SET valor=EXCLUDED.valor""", (chave, str(valor)))
 
 
 # ============================================================
@@ -300,11 +321,12 @@ def _coletar():
 # ============================================================
 #  TELEGRAM
 # ============================================================
-def _tg(method, payload):
-    if not TELEGRAM_TOKEN:
+def _tg(method, payload, token=None):
+    token = token or TELEGRAM_TOKEN
+    if not token:
         return {}
     try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+        r = requests.post(f"https://api.telegram.org/bot{token}/{method}",
                           json=payload, timeout=15)
         return r.json()
     except Exception as e:
@@ -337,6 +359,63 @@ def _encaminhar_postagem(n, quem):
              f"(aprovada por {quem})")
     _tg("sendMessage", {"chat_id": TELEGRAM_POSTAGEM_CHAT, "text": texto,
                         "disable_web_page_preview": False})
+
+
+def _top_destaques(horas=RESUMO_HORAS, n=RESUMO_TOP_N):
+    """As N noticias de maior nota do fluxo serio (sem fontes dedicadas) nas ultimas X horas."""
+    limite = int(time.time()) - horas * 3600
+    try:
+        return db_all("""SELECT chave, titulo, beat, score, link, ts, decisao
+                         FROM noticias_enviadas
+                         WHERE ts >= %s AND beat NOT IN %s
+                         ORDER BY score DESC, ts DESC
+                         LIMIT %s""",
+                      (limite, tuple(SEMPRE_BEATS), n))
+    except Exception as e:
+        print(f"[aviso] top_destaques: {e}")
+        return []
+
+
+def _enviar_resumo():
+    """Manda o Top N das ultimas horas no 2o bot, com botoes Aprovar/Rejeitar."""
+    if not (TELEGRAM_TOKEN2 and TELEGRAM_CHAT2):
+        return False
+    rows = _top_destaques()
+    if not rows:
+        return False
+    cab = (f"TOP {len(rows)} — destaques das últimas {RESUMO_HORAS}h\n"
+           f"Vote em cada uma abaixo:")
+    _tg("sendMessage", {"chat_id": TELEGRAM_CHAT2, "text": cab,
+                        "disable_web_page_preview": True}, token=TELEGRAM_TOKEN2)
+    for i, r in enumerate(rows, 1):
+        chave, titulo, beat, score, link, ts, decisao = r
+        base = f"{i}. {titulo}\n\n{beat} · relevância {score}\n{link or ''}"
+        if decisao:
+            rotulo = "✅ APROVADA" if decisao == "aprovada" else "❌ REJEITADA"
+            _tg("sendMessage", {"chat_id": TELEGRAM_CHAT2,
+                                "text": base + f"\n\n— já {decisao} ({rotulo})",
+                                "disable_web_page_preview": False}, token=TELEGRAM_TOKEN2)
+        else:
+            _tg("sendMessage", {"chat_id": TELEGRAM_CHAT2, "text": base,
+                                "reply_markup": _teclado(chave),
+                                "disable_web_page_preview": False}, token=TELEGRAM_TOKEN2)
+    return True
+
+
+def _checar_resumo():
+    """Dispara o resumo se ja passou RESUMO_HORAS desde o ultimo. Estado guardado no banco."""
+    try:
+        ultimo = int(_get_config("ultimo_resumo_ts") or 0)
+    except Exception:
+        ultimo = 0
+    agora = int(time.time())
+    if ultimo == 0:
+        # primeira vez: marca o relogio sem disparar (evita spam em deploy novo)
+        _set_config("ultimo_resumo_ts", agora)
+        return
+    if agora - ultimo >= RESUMO_HORAS * 3600:
+        if _enviar_resumo():
+            _set_config("ultimo_resumo_ts", agora)
 
 
 # ============================================================
@@ -530,39 +609,84 @@ def tg_setup():
     return jsonify(_tg("setWebhook", payload))
 
 
+def _processar_update(upd, token):
+    """Trata callbacks (Aprovar/Rejeitar) usando o token do bot que recebeu."""
+    cq = upd.get("callback_query")
+    if not cq:
+        return
+    data = cq.get("data", "")
+    msg = cq.get("message", {}) or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    msg_id = msg.get("message_id")
+    frm = cq.get("from", {}) or {}
+    if "|" not in data:
+        return
+    acao, chave = data.split("|", 1)
+    quem = frm.get("first_name") or str(frm.get("id"))
+    res = _registrar_decisao(chave, acao == "ap", quem)
+    if res["ja_decidida"]:
+        _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
+            "text": f"Já foi {res['status']} por {res.get('decidido_por','alguém')}. Voto ignorado."},
+            token=token)
+    elif res["novo"]:
+        rotulo = "✅ APROVADA" if res["status"] == "aprovada" else "❌ REJEITADA"
+        extra = " — encaminhada para postagem" if res["status"] == "aprovada" else ""
+        if chat_id and msg_id:
+            novo_texto = (msg.get("text", "") + f"\n\n— {rotulo} por {quem}{extra}")
+            _tg("editMessageText", {"chat_id": chat_id, "message_id": msg_id,
+                                    "text": novo_texto, "reply_markup": {"inline_keyboard": []},
+                                    "disable_web_page_preview": True}, token=token)
+        _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
+                                    "text": "Decisão registrada. Obrigado!"}, token=token)
+    else:
+        _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
+                                    "text": "Notícia não encontrada."}, token=token)
+
+
 @app.route("/telegram/webhook", methods=["POST"])
 def tg_webhook():
     if TELEGRAM_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET:
         return "forbidden", 403
     upd = request.get_json(force=True, silent=True) or {}
-    cq = upd.get("callback_query")
-    if cq:
-        data = cq.get("data", "")
-        msg = cq.get("message", {}) or {}
-        chat_id = (msg.get("chat") or {}).get("id")
-        msg_id = msg.get("message_id")
-        frm = cq.get("from", {}) or {}
-        if "|" in data:
-            acao, chave = data.split("|", 1)
-            quem = frm.get("first_name") or str(frm.get("id"))
-            res = _registrar_decisao(chave, acao == "ap", quem)
-            if res["ja_decidida"]:
-                _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
-                    "text": f"Já foi {res['status']} por {res.get('decidido_por','alguém')}. Voto ignorado."})
-            elif res["novo"]:
-                rotulo = "✅ APROVADA" if res["status"] == "aprovada" else "❌ REJEITADA"
-                extra = " — encaminhada para postagem" if res["status"] == "aprovada" else ""
-                if chat_id and msg_id:
-                    novo_texto = (msg.get("text", "") + f"\n\n— {rotulo} por {quem}{extra}")
-                    _tg("editMessageText", {"chat_id": chat_id, "message_id": msg_id,
-                                            "text": novo_texto, "reply_markup": {"inline_keyboard": []},
-                                            "disable_web_page_preview": True})
-                _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
-                                            "text": "Decisão registrada. Obrigado!"})
-            else:
-                _tg("answerCallbackQuery", {"callback_query_id": cq.get("id"),
-                                            "text": "Notícia não encontrada."})
+    _processar_update(upd, TELEGRAM_TOKEN)
     return jsonify({"ok": True})
+
+
+@app.route("/telegram/setup2")
+def tg_setup2():
+    if not TELEGRAM_TOKEN2:
+        return "Configure PALPYT_TG_TOKEN2 primeiro.", 400
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    payload = {"url": f"https://{host}/telegram/webhook2",
+               "allowed_updates": ["callback_query", "message"]}
+    if TELEGRAM_SECRET2:
+        payload["secret_token"] = TELEGRAM_SECRET2
+    return jsonify(_tg("setWebhook", payload, token=TELEGRAM_TOKEN2))
+
+
+@app.route("/telegram/webhook2", methods=["POST"])
+def tg_webhook2():
+    if TELEGRAM_SECRET2 and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET2:
+        return "forbidden", 403
+    upd = request.get_json(force=True, silent=True) or {}
+    _processar_update(upd, TELEGRAM_TOKEN2)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/destaques")
+def api_destaques():
+    rows = _top_destaques()
+    out = [{"chave": r[0], "titulo": r[1], "beat": r[2], "score": r[3],
+            "link": r[4] or "", "ts": r[5], "status": r[6] or "pendente"} for r in rows]
+    return jsonify({"horas": RESUMO_HORAS, "total": len(out), "itens": out})
+
+
+@app.route("/telegram/resumo")
+def tg_resumo_teste():
+    """Dispara o resumo Top N na hora (para testar sem esperar as 3h)."""
+    ok = _enviar_resumo()
+    return jsonify({"enviado": ok,
+                    "bot2_configurado": bool(TELEGRAM_TOKEN2 and TELEGRAM_CHAT2)})
 
 
 # ============================================================
@@ -572,6 +696,7 @@ def _loop():
     while True:
         try:
             minerar(force=True)
+            _checar_resumo()
         except Exception as e:
             print(f"[aviso] loop: {e}")
         time.sleep(INTERVALO_MIN * 60)
