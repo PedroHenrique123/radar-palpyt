@@ -61,6 +61,14 @@ CONFIABILIDADE_BONUS = 12  # bonus de relevancia para fontes confiaveis
 RESUMO_HORAS   = 3     # a cada quantas horas mandar o Top N
 RESUMO_TOP_N   = 5     # quantas noticias no resumo
 
+API_TOKEN = os.environ.get("PALPYT_API_TOKEN", "")  # opcional: se definido, protege endpoints de escrita
+
+# Agrupamento por EVENTO (mesma noticia em varios veiculos vira 1 card)
+EVENTO_SIMILARIDADE = 0.4   # similaridade minima entre titulos p/ juntar no mesmo evento
+CORROBORACAO_BONUS  = 6     # por fonte confiavel EXTRA cobrindo o mesmo evento
+CORROBORACAO_MAX    = 18    # teto do bonus de corroboracao
+VELOCIDADE_BONUS    = 10    # evento com 2+ materias novas em 45 min (acelerando)
+
 APRENDIZADO_PASSO = 3   # quanto cada decisao move o peso de uma caracteristica
 APRENDIZADO_MAX   = 30  # limite do ajuste aprendido
 
@@ -181,6 +189,16 @@ def init_db():
         cur.execute("""CREATE TABLE IF NOT EXISTS aprendizado
                        (feature TEXT PRIMARY KEY, ajuste DOUBLE PRECISION, saldo INTEGER)""")
         cur.execute("CREATE TABLE IF NOT EXISTS config (chave TEXT PRIMARY KEY, valor TEXT)")
+        # loop de desempenho (resultado real das aprovadas)
+        cur.execute("ALTER TABLE noticias_enviadas ADD COLUMN IF NOT EXISTS url_post TEXT")
+        cur.execute("ALTER TABLE noticias_enviadas ADD COLUMN IF NOT EXISTS engajamento BIGINT")
+        cur.execute("ALTER TABLE noticias_enviadas ADD COLUMN IF NOT EXISTS virou_mercado TEXT")
+        cur.execute("ALTER TABLE noticias_enviadas ADD COLUMN IF NOT EXISTS resultado_em BIGINT")
+        # calendario de eventos apostaveis
+        cur.execute("""CREATE TABLE IF NOT EXISTS eventos_futuros
+                       (id SERIAL PRIMARY KEY, titulo TEXT, categoria TEXT,
+                        data_evento BIGINT, descricao TEXT, criado_em BIGINT,
+                        notificado INTEGER DEFAULT 0)""")
     finally:
         con.close()
 
@@ -238,6 +256,90 @@ def _sem_acento(s):
 def _confiavel(fonte):
     f = _sem_acento((fonte or "").lower())
     return any(t in f for t in FONTES_CONFIAVEIS)
+
+
+_STOPWORDS = {"a","o","e","as","os","de","do","da","dos","das","em","no","na","nos","nas",
+              "um","uma","uns","umas","ao","aos","com","por","para","pra","que","se","sua",
+              "seu","suas","seus","mais","menos","muito","apos","ate","sobre","entre","como",
+              "diz","tem","vai","ser","foi","sao","esta","este","essa","esse","pelo","pela",
+              "contra","sem","nao"}
+
+
+def _tokens_titulo(titulo):
+    """Palavras significativas do titulo (sem o sufixo ' - Veiculo' do Google News)."""
+    t = titulo or ""
+    if " - " in t:
+        pref = t.rsplit(" - ", 1)[0]
+        if len(pref) >= 15:
+            t = pref
+    t = _sem_acento(t.lower())
+    t = re.sub(r"[^a-z0-9 ]", " ", t)
+    return {w for w in t.split() if len(w) >= 3 and w not in _STOPWORDS}
+
+
+def _similaridade(a, b):
+    """Similaridade entre conjuntos de palavras de 2 titulos.
+    Titulos curtos exigem sobreposicao maior (evita juntar noticias diferentes)."""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if inter < 2:
+        return 0.0
+    j = inter / len(a | b)
+    m = min(len(a), len(b))
+    if m >= 5 or inter >= 3:
+        return max(j, inter / m)
+    return j if j >= 0.6 else 0.0
+
+
+def _fonte_id(fonte):
+    f = _sem_acento((fonte or "").lower()).strip()
+    for t in FONTES_CONFIAVEIS:
+        if t in f:
+            return t
+    return f[:40]
+
+
+def _agrupar_eventos(itens, agora):
+    """Agrupa a mesma noticia coberta por varios veiculos num EVENTO unico.
+    Devolve 1 representante por evento, com bonus de corroboracao (varias
+    fontes confiaveis) e de velocidade (materias novas chegando rapido)."""
+    clusters = []
+    for n in sorted(itens, key=lambda x: x["score"], reverse=True):
+        tk = _tokens_titulo(n["titulo"])
+        alvo, melhor = None, 0.0
+        for c in clusters:
+            s = max((_similaridade(tk, t) for t in c["tokens_list"]), default=0.0)
+            if s > melhor:
+                melhor, alvo = s, c
+        if alvo is not None and melhor >= EVENTO_SIMILARIDADE:
+            alvo["membros"].append(n)
+            alvo["tokens_list"].append(tk)
+        else:
+            clusters.append({"tokens_list": [tk], "membros": [n]})
+
+    saida = []
+    for c in clusters:
+        membros = c["membros"]
+        rep = dict(max(membros, key=lambda m: (m["confiavel"], m["score"])))
+        veiculos, conf = [], set()
+        for m in membros:
+            if m["fonte"] not in veiculos:
+                veiculos.append(m["fonte"])
+            if m["confiavel"]:
+                conf.add(_fonte_id(m["fonte"]))
+        bonus = 0
+        if len(conf) >= 2:
+            bonus += min((len(conf) - 1) * CORROBORACAO_BONUS, CORROBORACAO_MAX)
+        recentes = [m for m in membros if (agora - m["epoch"]) <= 45 * 60]
+        if len(recentes) >= 2:
+            bonus += VELOCIDADE_BONUS
+        rep["confiavel"] = any(m["confiavel"] for m in membros)
+        rep["n_fontes"] = len(veiculos)
+        rep["veiculos"] = veiculos[:4]
+        rep["score"] = max(0, min(100, rep["score"] + bonus))
+        saida.append(rep)
+    return saida
 
 
 def _features(titulo, beat):
@@ -306,16 +408,18 @@ def _coletar():
                 "beat": nome, "epoch": ep or int(agora), "score": score,
                 "chave": chave, "feats": feats, "confiavel": confiavel,
             }
-    itens = sorted(achadas.values(), key=lambda x: x["score"], reverse=True)
+    todos = list(achadas.values())
+    dedicadas = [n for n in todos if n["beat"] in SEMPRE_BEATS]
+    eventos = _agrupar_eventos([n for n in todos if n["beat"] not in SEMPRE_BEATS], agora)
+    principais = sorted([n for n in eventos if n["score"] >= SCORE_MINIMO and n["confiavel"]],
+                        key=lambda x: x["score"], reverse=True)[:80]
+    itens = sorted(dedicadas + principais, key=lambda x: x["score"], reverse=True)
     cont = {}
     for n in itens:
         cont[n["beat"]] = cont.get(n["beat"], 0) + 1
     _DIAG["fontes"] = [b["nome"] for b in BEATS] + [f["nome"] for f in FEEDS_DIRETOS]
     _DIAG["contagem"] = cont
-    dedicadas = [n for n in itens if n["beat"] in SEMPRE_BEATS]
-    principais = [n for n in itens
-                  if n["beat"] not in SEMPRE_BEATS and n["score"] >= SCORE_MINIMO and n["confiavel"]][:80]
-    return sorted(dedicadas + principais, key=lambda x: x["score"], reverse=True)
+    return itens
 
 
 # ============================================================
@@ -344,7 +448,8 @@ def _teclado(chave):
 def _postar_telegram(n):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
-    texto = (f"{n['beat']}  (relevância {n['score']})\n\n"
+    extra = f" · {n['n_fontes']} veículos" if n.get("n_fontes", 1) >= 2 else ""
+    texto = (f"{n['beat']}  (relevância {n['score']}{extra})\n\n"
              f"{n['titulo']}\n\n{n['fonte']}\n{n['link']}")
     _tg("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": texto,
                         "reply_markup": _teclado(n["chave"]),
@@ -416,6 +521,44 @@ def _checar_resumo():
     if agora - ultimo >= RESUMO_HORAS * 3600:
         if _enviar_resumo():
             _set_config("ultimo_resumo_ts", agora)
+
+
+BRT_OFFSET = -3 * 3600  # horario de Brasilia (UTC-3, sem horario de verao)
+
+
+def _parse_data(s):
+    """Aceita AAAA-MM-DD ou DD/MM/AAAA, com hora HH:MM opcional (horario de Brasilia)."""
+    s = (s or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
+        try:
+            return int(calendar.timegm(time.strptime(s, fmt))) - BRT_OFFSET
+        except ValueError:
+            continue
+    return None
+
+
+def _checar_eventos():
+    """Avisa no bot 2 quando um evento do calendario esta a ate 2 dias de acontecer."""
+    if not (TELEGRAM_TOKEN2 and TELEGRAM_CHAT2):
+        return
+    agora = int(time.time())
+    try:
+        rows = db_all("""SELECT id, titulo, categoria, data_evento, descricao
+                         FROM eventos_futuros
+                         WHERE notificado=0 AND data_evento BETWEEN %s AND %s""",
+                      (agora, agora + 2 * 86400))
+    except Exception as e:
+        print(f"[aviso] checar_eventos: {e}")
+        return
+    for eid, titulo, cat, dt, desc in rows:
+        horas = max(1, int((dt - agora) / 3600))
+        quando = f"{horas // 24} dia(s)" if horas >= 24 else f"{horas}h"
+        texto = ("📅 EVENTO CHEGANDO (em ~" + quando + ")\n\n" + (titulo or "")
+                 + (f"\n{cat}" if cat else "")
+                 + (f"\n{desc}" if desc else "")
+                 + "\n\nHora de preparar o mercado/conteúdo na Palpyt.")
+        _tg("sendMessage", {"chat_id": TELEGRAM_CHAT2, "text": texto}, token=TELEGRAM_TOKEN2)
+        db_exec("UPDATE eventos_futuros SET notificado=1 WHERE id=%s", (eid,))
 
 
 # ============================================================
@@ -546,6 +689,7 @@ def api_noticias():
         "titulo": n["titulo"], "link": n["link"], "fonte": n["fonte"],
         "beat": n["beat"], "score": n["score"],
         "min": int(max(0, (agora - n["epoch"]) / 60)),
+        "fontes": n.get("n_fontes", 1), "veiculos": n.get("veiculos", []),
     } for n in itens]
     return jsonify({"atualizado": int(agora), "total": len(saida), "itens": saida})
 
@@ -584,8 +728,19 @@ def api_categorias():
     return jsonify({"categorias": CATEGORIAS})
 
 
+def _auth_ok():
+    """Se PALPYT_API_TOKEN estiver definido, exige o header X-Api-Token nas escritas."""
+    if not API_TOKEN:
+        return True
+    tok = request.headers.get("X-Api-Token") or \
+        request.headers.get("Authorization", "").replace("Bearer ", "")
+    return tok == API_TOKEN
+
+
 @app.route("/api/voto", methods=["POST"])
 def api_voto():
+    if not _auth_ok():
+        return jsonify({"erro": "não autorizado"}), 401
     body = request.get_json(force=True, silent=True) or {}
     chave = body.get("chave")
     if not chave:
@@ -595,6 +750,103 @@ def api_voto():
     res = _registrar_decisao(chave, aprovar, usuario)
     return jsonify({"ok": True, "chave": chave, "status": res["status"],
                     "decidido_por": res.get("decidido_por", ""), "ja_decidida": res["ja_decidida"]})
+
+
+@app.route("/api/resultado", methods=["POST"])
+def api_resultado():
+    """Registra o resultado real de uma noticia aprovada (post publicado, engajamento, mercado)."""
+    if not _auth_ok():
+        return jsonify({"erro": "não autorizado"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    chave = body.get("chave")
+    if not chave:
+        return jsonify({"erro": "campo 'chave' é obrigatório"}), 400
+    url_post = body.get("url_post")
+    engaj = body.get("engajamento")
+    try:
+        engaj = int(engaj) if engaj is not None and str(engaj) != "" else None
+    except (TypeError, ValueError):
+        return jsonify({"erro": "engajamento deve ser um número"}), 400
+    mercado = body.get("virou_mercado")
+    if mercado is not None:
+        mercado = "sim" if str(mercado).lower() in ("1", "sim", "true", "yes") else "nao"
+    con = _conn()
+    try:
+        cur = con.cursor()
+        cur.execute("""UPDATE noticias_enviadas
+                       SET url_post=COALESCE(%s, url_post),
+                           engajamento=COALESCE(%s, engajamento),
+                           virou_mercado=COALESCE(%s, virou_mercado),
+                           resultado_em=%s
+                       WHERE chave=%s""",
+                    (url_post, engaj, mercado, int(time.time()), chave))
+        achou = cur.rowcount > 0
+    finally:
+        con.close()
+    if not achou:
+        return jsonify({"erro": "notícia não encontrada"}), 404
+    return jsonify({"ok": True, "chave": chave})
+
+
+@app.route("/api/desempenho")
+def api_desempenho():
+    """Aprovadas + resultado real registrado; e um resumo por categoria."""
+    rows = db_all("""SELECT chave, titulo, beat, score, decidido_em,
+                            url_post, engajamento, virou_mercado
+                     FROM noticias_enviadas WHERE decisao='aprovada'
+                     ORDER BY decidido_em DESC NULLS LAST LIMIT 200""")
+    itens, resumo = [], {}
+    for r in rows:
+        itens.append({"chave": r[0], "titulo": r[1], "beat": r[2], "score": r[3],
+                      "decidido_em": r[4] or 0, "url_post": r[5] or "",
+                      "engajamento": r[6], "virou_mercado": r[7] or ""})
+        b = resumo.setdefault(r[2] or "?", {"aprovadas": 0, "com_resultado": 0,
+                                            "engaj_total": 0, "mercados": 0})
+        b["aprovadas"] += 1
+        if r[6] is not None or r[7]:
+            b["com_resultado"] += 1
+        if r[6] is not None:
+            b["engaj_total"] += int(r[6])
+        if (r[7] or "") == "sim":
+            b["mercados"] += 1
+    return jsonify({"total": len(itens), "itens": itens, "resumo_por_beat": resumo})
+
+
+@app.route("/api/eventos", methods=["GET", "POST"])
+def api_eventos():
+    """Calendario de eventos apostaveis (Copom, jogos, eleicoes, premiacoes...)."""
+    if request.method == "GET":
+        agora = int(time.time())
+        rows = db_all("""SELECT id, titulo, categoria, data_evento, descricao, notificado
+                         FROM eventos_futuros WHERE data_evento >= %s
+                         ORDER BY data_evento ASC LIMIT 100""", (agora - 86400,))
+        itens = [{"id": r[0], "titulo": r[1], "categoria": r[2] or "",
+                  "data_evento": r[3],
+                  "data_fmt": time.strftime("%d/%m/%Y %H:%M", time.gmtime(r[3] + BRT_OFFSET)),
+                  "dias_restantes": max(0, int((r[3] - agora) / 86400)),
+                  "descricao": r[4] or "", "avisado": bool(r[5])} for r in rows]
+        return jsonify({"total": len(itens), "itens": itens})
+    # POST: adicionar evento
+    if not _auth_ok():
+        return jsonify({"erro": "não autorizado"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    titulo = (body.get("titulo") or "").strip()
+    dt = _parse_data(body.get("data") or "")
+    if not titulo or not dt:
+        return jsonify({"erro": "envie 'titulo' e 'data' (AAAA-MM-DD ou DD/MM/AAAA, hora opcional)"}), 400
+    db_exec("""INSERT INTO eventos_futuros (titulo, categoria, data_evento, descricao, criado_em)
+               VALUES (%s,%s,%s,%s,%s)""",
+            (titulo, (body.get("categoria") or "").strip(),
+             dt, (body.get("descricao") or "").strip(), int(time.time())))
+    return jsonify({"ok": True, "titulo": titulo})
+
+
+@app.route("/api/eventos/<int:eid>", methods=["DELETE"])
+def api_eventos_del(eid):
+    if not _auth_ok():
+        return jsonify({"erro": "não autorizado"}), 401
+    db_exec("DELETE FROM eventos_futuros WHERE id=%s", (eid,))
+    return jsonify({"ok": True, "id": eid})
 
 
 @app.route("/telegram/setup")
@@ -710,6 +962,7 @@ def _loop():
         try:
             minerar(force=True)
             _checar_resumo()
+            _checar_eventos()
         except Exception as e:
             print(f"[aviso] loop: {e}")
         time.sleep(INTERVALO_MIN * 60)
