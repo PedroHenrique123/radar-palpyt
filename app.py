@@ -689,6 +689,19 @@ def tg_resumo_teste():
                     "bot2_configurado": bool(TELEGRAM_TOKEN2 and TELEGRAM_CHAT2)})
 
 
+@app.route("/telegram/teste2")
+def tg_teste2():
+    """Manda uma msg simples no bot2 e devolve a resposta CRUA do Telegram (pra achar o erro)."""
+    if not TELEGRAM_TOKEN2:
+        return jsonify({"erro": "PALPYT_TG_TOKEN2 nao configurado"}), 400
+    if not TELEGRAM_CHAT2:
+        return jsonify({"erro": "PALPYT_TG_CHAT2 nao configurado"}), 400
+    resp = _tg("sendMessage",
+               {"chat_id": TELEGRAM_CHAT2, "text": "teste do bot 2 (Top 5) ✅"},
+               token=TELEGRAM_TOKEN2)
+    return jsonify({"chat_id_usado": TELEGRAM_CHAT2, "resposta_telegram": resp})
+
+
 # ============================================================
 #  VARREDURA DE FUNDO + START
 # ============================================================
